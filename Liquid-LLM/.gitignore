@@ -1,0 +1,33 @@
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv
+.env.*
+/conda-env/
+
+# Data & checkpoints
+data/**/*
+!data/README.md
+models/**/*
+!models/README.md
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+
+# Logs
+wandb/
+logs/
+outputs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
