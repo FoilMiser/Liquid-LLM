@@ -1,0 +1,6 @@
+transformers>=4.43
+datasets>=2.20
+accelerate>=0.33
+sentencepiece
+einops
+google-cloud-storage
