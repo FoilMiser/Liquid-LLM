@@ -118,6 +118,11 @@ def ensure_hf_token(
     for candidate in candidates:
         if not candidate:
             continue
+        if log:
+            log.info(
+                "Attempting to access Hugging Face token from Secret Manager secret '%s'.",
+                candidate,
+            )
         name = f"projects/{project_id}/secrets/{candidate}/versions/latest"
         try:
             response = client.access_secret_version(name=name)
