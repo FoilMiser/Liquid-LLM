@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 from typing import Iterable, Optional
 
+import google.auth
+from google.api_core import exceptions as gcloud_exceptions
+from google.auth import exceptions as auth_exceptions
 from google.cloud import secretmanager
 
 
@@ -18,6 +21,9 @@ _PROJECT_ENV_VARS: Iterable[str] = (
 )
 
 
+_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+
+
 def _detect_project_id() -> Optional[str]:
     """Best effort detection of the active Google Cloud project ID/number."""
 
@@ -26,6 +32,26 @@ def _detect_project_id() -> Optional[str]:
         if value:
             return value
     return None
+
+
+def _build_secret_client(log=None):
+    """Construct a Secret Manager client with cloud-platform scope if possible."""
+
+    credentials = None
+    project_from_creds: Optional[str] = None
+    try:
+        credentials, project_from_creds = google.auth.default(scopes=(_CLOUD_PLATFORM_SCOPE,))
+    except auth_exceptions.DefaultCredentialsError as exc:
+        if log:
+            log.warning("Unable to load default Google credentials: %s", exc)
+
+    client = (
+        secretmanager.SecretManagerServiceClient(credentials=credentials)
+        if credentials is not None
+        else secretmanager.SecretManagerServiceClient()
+    )
+
+    return client, project_from_creds
 
 
 def ensure_hf_token(
@@ -62,7 +88,11 @@ def ensure_hf_token(
             log.info("Using Hugging Face token from environment variable.")
         return token
 
-    project_id = _detect_project_id()
+    client, project_from_creds = _build_secret_client(log=log)
+
+    project_id = _detect_project_id() or project_from_creds
+    if log and project_from_creds and project_id == project_from_creds:
+        log.info("Resolved Google Cloud project from application default credentials: %s", project_id)
     if not project_id:
         raise RuntimeError(
             "Unable to determine Google Cloud project for Secret Manager. "
@@ -84,15 +114,36 @@ def ensure_hf_token(
         if fallback not in candidates:
             candidates.append(fallback)
 
-    client = secretmanager.SecretManagerServiceClient()
+    # Remove duplicates while preserving order so we don't spam Secret Manager or logs.
+    deduped_candidates = []
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        deduped_candidates.append(candidate)
+        seen.add(candidate)
+    candidates = deduped_candidates
+
     errors = []
     for candidate in candidates:
         if not candidate:
             continue
+        if log:
+            log.info(
+                "Attempting to access Hugging Face token from Secret Manager secret '%s'.",
+                candidate,
+            )
         name = f"projects/{project_id}/secrets/{candidate}/versions/latest"
         try:
             response = client.access_secret_version(name=name)
         except Exception as exc:  # pragma: no cover - bubble up with context
+            if log and isinstance(exc, gcloud_exceptions.PermissionDenied):
+                log.error(
+                    "Permission denied when accessing secret '%s'. Ensure the Vertex AI service "
+                    "account has Secret Manager Secret Accessor roles and the VM has the "
+                    "cloud-platform OAuth scope.",
+                    candidate,
+                )
             errors.append((candidate, exc))
             continue
 
