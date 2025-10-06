@@ -58,6 +58,7 @@ def run_training(
     log_interval: int = 50,
     precision: str = "fp16",
     model: dict = None,
+    hf_token: str | None = None,
 ):
     log = get_logger("stage0")
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -74,6 +75,10 @@ def run_training(
     # ---------------------------------------------------------------------
     # Data
     # ---------------------------------------------------------------------
+    if hf_token:
+        os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", hf_token)
+        os.environ.setdefault("HF_TOKEN", hf_token)
+
     train_dl, val_dl, vocab_size, pad_id, tok = build_dataloaders(
         teacher_name=teacher_name,
         dataset_name=dataset_name,
@@ -81,6 +86,7 @@ def run_training(
         block_size=block_size,
         global_batch=global_batch,
         seed=seed,
+        hf_token=hf_token,
     )
 
     # ---------------------------------------------------------------------
@@ -154,6 +160,7 @@ def run_training(
         step=step0,
         micro_batch=micro_batch,
         global_batch=global_batch,
+        hf_token=hf_token,
         # logger used by train_loop
         log=get_logger("train"),
         # optional bookkeeping for your own use

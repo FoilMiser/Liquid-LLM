@@ -142,6 +142,7 @@ def train_loop(state):
     total_steps   = state["train_steps"]
     ckptio        = state["ckptio"]
     precision     = state.get("precision", "fp16")
+    hf_token      = state.get("hf_token")
 
     # --- Time-based checkpoint cadence & retention ---
     time_ckpt_secs            = int(state.get("time_ckpt_secs", 1800))            # every 30 min by default
@@ -170,7 +171,8 @@ def train_loop(state):
     # Optional teacher (for KD)
     teacher = None
     if kd_alpha and kd_alpha > 0:
-        teacher = AutoModelForCausalLM.from_pretrained(teacher_name).to(device).eval()
+        auth_kwargs = {"token": hf_token} if hf_token else {}
+        teacher = AutoModelForCausalLM.from_pretrained(teacher_name, **auth_kwargs).to(device).eval()
         for p in teacher.parameters():
             p.requires_grad_(False)
 
