@@ -114,6 +114,16 @@ def ensure_hf_token(
         if fallback not in candidates:
             candidates.append(fallback)
 
+    # Remove duplicates while preserving order so we don't spam Secret Manager or logs.
+    deduped_candidates = []
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        deduped_candidates.append(candidate)
+        seen.add(candidate)
+    candidates = deduped_candidates
+
     errors = []
     for candidate in candidates:
         if not candidate:
