@@ -1,224 +1,183 @@
-"""Command line interface for the Vertex Stage0 trainer."""
-from __future__ import annotations
-
-import argparse
-from copy import deepcopy
+import os
+import random
 from pathlib import Path
-from typing import Any, Dict, Iterable, MutableMapping, Optional
+from datetime import datetime
 
-import yaml
+import numpy as np
+import torch
 
-# Default hyper-parameter values mirror the public Stage0 configuration.
-_DEFAULTS: Dict[str, Any] = {
-    "resume_gcs_uri": None,
-    "block_size": 512,
-    "teacher_name": "gpt2-xl",
-    "dataset_name": "wikitext",
-    "dataset_config": "wikitext-103-raw-v1",
-    "output_gcs_uri": None,
-    "local_workdir": "/tmp/liquid_work",
-    "seed": 42,
-    "global_batch": 64,
-    "micro_batch": 8,
-    "lr": 3e-4,
-    "weight_decay": 0.1,
-    "betas": [0.9, 0.95],
-    "eps": 1e-8,
-    "warmup_steps": 2000,
-    "train_steps": 45_000,
-    "eval_every": 500,
-    "save_every": 1000,
-    "log_interval": 50,
-    "grad_clip": 1.0,
-    "kd_alpha": 0.5,
-    "kd_temperature": 1.0,
-    "time_ckpt_secs": 1800,
-    "time_ckpt_retention_secs": 14_400,
-    "time_ckpt_keep_k": None,
-    "best_ckpt_keep_k": 3,
-    "best_ckpt_retention_secs": None,
-    "step_ckpt_keep_k": 5,
-    "step_ckpt_retention_secs": None,
-    "precision": "no",
-    "model": {
-        "d_model": 768,
-        "n_layers": 10,
-        "n_heads": 12,
-        "dropout": 0.0,
-    },
-}
+from transformers import AutoTokenizer  # (kept if other modules rely on it)
+
+from ..data.wikitext import build_dataloaders
+from ..models.liquid import build_student_model
+from ..training.optim import build_optimizer
+from ..training.schedules import build_scheduler
+from ..training.loop import train_loop
+from ..utils.logging import get_logger
+from ..io.checkpoints import load_from_uri, save_and_maybe_upload
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Launch Liquid-LLM Stage0 training on Vertex"
+def _expand_output_uri(output_gcs_uri: str | None) -> str | None:
+    """
+    Vertex passes job args directly to Python, so any shell substitutions
+    like $(date ...) won't expand. Handle common patterns here, and also
+    create a sensible default path if None is provided.
+    """
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    if output_gcs_uri:
+        # Replace a common shell placeholder if present
+        if "$(" in output_gcs_uri:
+            output_gcs_uri = output_gcs_uri.replace("$(date +%Y%m%d-%H%M%S)", ts)
+        return output_gcs_uri
+
+    # If not provided, default to a timestamped run folder under the bucket.
+    # Adjust the base prefix to your preference.
+    return f"gs://liquid-llm-bucket/liquid-llm/stage0/checkpoints/vertex_runs/{ts}"
+
+
+def run_training(
+    resume_gcs_uri: str | None,
+    block_size: int,
+    teacher_name: str,
+    dataset_name: str,
+    dataset_config: str,
+    output_gcs_uri: str | None = None,
+    local_workdir: str = "/tmp/liquid_work",
+    seed: int = 42,
+    global_batch: int = 64,
+    micro_batch: int = 8,
+    lr: float = 3e-4,
+    weight_decay: float = 0.1,
+    betas=(0.9, 0.95),
+    eps: float = 1e-8,
+    warmup_steps: int = 2000,
+    train_steps: int = 45000,
+    eval_every: int = 500,
+    save_every: int = 1000,
+    log_interval: int = 50,
+    precision: str = "fp16",
+    model: dict = None,
+):
+    log = get_logger("stage0")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ---------------------------------------------------------------------
+    # Seeding
+    # ---------------------------------------------------------------------
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # ---------------------------------------------------------------------
+    # Data
+    # ---------------------------------------------------------------------
+    train_dl, val_dl, vocab_size, pad_id, tok = build_dataloaders(
+        teacher_name=teacher_name,
+        dataset_name=dataset_name,
+        dataset_config=dataset_config,
+        block_size=block_size,
+        global_batch=global_batch,
+        seed=seed,
     )
 
-    # Core dataset + IO arguments (Vertex wires resume/output paths).
-    parser.add_argument("--resume_gcs_uri", type=str, default=None)
-    parser.add_argument("--block_size", type=int, required=True)
-    parser.add_argument("--teacher_name", type=str, required=True)
-    parser.add_argument("--dataset_name", type=str, required=True)
-    parser.add_argument("--dataset_config", type=str, required=True)
-
-    parser.add_argument("--output_gcs_uri", type=str, default=None)
-    parser.add_argument("--local_workdir", type=str, default=_DEFAULTS["local_workdir"])
-
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="Optional YAML file containing default configuration overrides.",
+    # ---------------------------------------------------------------------
+    # Model
+    # ---------------------------------------------------------------------
+    model = model or {}
+    margs = dict(
+        d_model=model.get("d_model", 768),
+        n_layers=model.get("n_layers", 10),
+        n_heads=model.get("n_heads", 12),
+        dropout=model.get("dropout", 0.0),
     )
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--global_batch", type=int, default=None)
-    parser.add_argument("--micro_batch", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--weight_decay", type=float, default=None)
-    parser.add_argument("--betas", type=float, nargs=2, default=None)
-    parser.add_argument("--eps", type=float, default=None)
-    parser.add_argument("--warmup_steps", type=int, default=None)
-    parser.add_argument("--train_steps", type=int, default=None)
-    parser.add_argument("--eval_every", type=int, default=None)
-    parser.add_argument("--teacher_eval_every", type=int, default=None)
-    parser.add_argument("--save_every", type=int, default=None)
-    parser.add_argument("--log_interval", type=int, default=None)
-    parser.add_argument("--grad_clip", type=float, default=None)
-    parser.add_argument("--kd_alpha", type=float, default=None)
-    parser.add_argument("--kd_temperature", type=float, default=None)
+    student = build_student_model(
+        vocab_size=vocab_size,
+        pad_id=pad_id,
+        **margs,
+    ).to(device)
 
-    # Vertex-managed checkpoint controls.
-    parser.add_argument("--time_ckpt_secs", type=int, default=None)
-    parser.add_argument("--time_ckpt_retention_secs", type=int, default=None)
-    parser.add_argument("--time_ckpt_keep_k", type=int, default=None)
-    parser.add_argument("--best_ckpt_keep_k", type=int, default=None)
-    parser.add_argument("--best_ckpt_retention_secs", type=int, default=None)
-    parser.add_argument("--step_ckpt_keep_k", type=int, default=None)
-    parser.add_argument("--step_ckpt_retention_secs", type=int, default=None)
+    # ---------------------------------------------------------------------
+    # Optimizer / Scheduler
+    # ---------------------------------------------------------------------
+    optimizer = build_optimizer(
+        student, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps
+    )
+    scheduler = build_scheduler(
+        optimizer, warmup_steps=warmup_steps, total_steps=train_steps
+    )
 
-    # Precision knobs (Vertex passes bf16/fp16 flags separately).
-    parser.add_argument("--fp16", action="store_true", help="Force fp16 training")
-    parser.add_argument("--bf16", action="store_true", help="Force bf16 training")
+    # ---------------------------------------------------------------------
+    # Resume (optional)
+    # ---------------------------------------------------------------------
+    step0 = 0
+    if resume_gcs_uri:
+        try:
+            step0 = load_from_uri(student, optimizer, scheduler, resume_gcs_uri)
+            log.info(f"Resumed from {resume_gcs_uri} at step {step0}")
+        except Exception as e:
+            log.warning(f"Resume failed: {e}")
 
-    # Model architecture overrides.
-    parser.add_argument("--d_model", type=int, default=None)
-    parser.add_argument("--n_layers", type=int, default=None)
-    parser.add_argument("--n_heads", type=int, default=None)
-    parser.add_argument("--dropout", type=float, default=None)
+    # ---------------------------------------------------------------------
+    # Outputs
+    # ---------------------------------------------------------------------
+    local_outdir = Path(local_workdir) / "outputs"
+    local_outdir.mkdir(parents=True, exist_ok=True)
+    gcs_outdir = _expand_output_uri(output_gcs_uri)
+    if gcs_outdir:
+        log.info(f"Writing checkpoints to {gcs_outdir}")
 
-    return parser
-
-
-def _load_yaml(path: Optional[str]) -> Dict[str, Any]:
-    if not path:
-        return {}
-    data = yaml.safe_load(Path(path).read_text())
-    if data is None:
-        return {}
-    if not isinstance(data, MutableMapping):
-        raise ValueError("Trainer config YAML must contain a mapping at the top level")
-    return dict(data)
-
-
-def _cli_override(value: Any, fallback: Any) -> Any:
-    return fallback if value is None else value
-
-
-def _ensure_jsonable(value: Any) -> Any:
-    if isinstance(value, tuple):
-        return list(value)
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, MutableMapping):
-        return {k: _ensure_jsonable(v) for k, v in value.items()}
-    if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
-        result = []
-        for item in value:
-            if isinstance(item, MutableMapping) or (
-                isinstance(item, Iterable) and not isinstance(item, (str, bytes))
-            ):
-                result.append(_ensure_jsonable(item))
-            else:
-                result.append(item)
-        return result
-    return value
-
-
-def parse_args(argv: Optional[Iterable[str]] = None) -> Dict[str, Any]:
-    parser = _parser()
-    args = parser.parse_args(argv)
-
-    merged = deepcopy(_DEFAULTS)
-    yaml_overrides = _load_yaml(args.config)
-    for key, value in yaml_overrides.items():
-        if key == "model" and isinstance(value, MutableMapping):
-            merged["model"].update(value)
-        else:
-            merged[key] = value
-
-    def choose(name: str, default: Any = None) -> Any:
-        cli_value = getattr(args, name)
-        fallback = merged.get(name, default)
-        return _cli_override(cli_value, fallback)
-
-    betas = choose("betas")
-    if betas is not None:
-        betas = list(betas)
-
-    precision = merged.get("precision", _DEFAULTS["precision"])
-    if args.bf16:
-        precision = "bf16"
-    elif args.fp16:
-        precision = "fp16"
-
-    teacher_eval_every = choose("teacher_eval_every")
-    eval_every = choose("eval_every")
-    if teacher_eval_every is not None:
-        eval_every = teacher_eval_every
-
-    cfg: Dict[str, Any] = {
-        "resume_gcs_uri": args.resume_gcs_uri,
-        "block_size": args.block_size,
-        "teacher_name": args.teacher_name,
-        "dataset_name": args.dataset_name,
-        "dataset_config": args.dataset_config,
-        "output_gcs_uri": args.output_gcs_uri,
-        "local_workdir": args.local_workdir,
-        "seed": choose("seed"),
-        "global_batch": choose("global_batch"),
-        "micro_batch": choose("micro_batch"),
-        "lr": choose("lr"),
-        "weight_decay": choose("weight_decay"),
-        "betas": betas,
-        "eps": choose("eps"),
-        "warmup_steps": choose("warmup_steps"),
-        "train_steps": choose("train_steps"),
-        "eval_every": eval_every,
-        "save_every": choose("save_every"),
-        "log_interval": choose("log_interval"),
-        "grad_clip": choose("grad_clip"),
-        "kd_alpha": choose("kd_alpha"),
-        "kd_temperature": choose("kd_temperature"),
-        "time_ckpt_secs": choose("time_ckpt_secs"),
-        "time_ckpt_retention_secs": choose("time_ckpt_retention_secs"),
-        "time_ckpt_keep_k": choose("time_ckpt_keep_k"),
-        "best_ckpt_keep_k": choose("best_ckpt_keep_k"),
-        "best_ckpt_retention_secs": choose("best_ckpt_retention_secs"),
-        "step_ckpt_keep_k": choose("step_ckpt_keep_k"),
-        "step_ckpt_retention_secs": choose("step_ckpt_retention_secs"),
-        "precision": precision,
-        "model": {
-            "d_model": _cli_override(args.d_model, merged["model"].get("d_model")),
-            "n_layers": _cli_override(args.n_layers, merged["model"].get("n_layers")),
-            "n_heads": _cli_override(args.n_heads, merged["model"].get("n_heads")),
-            "dropout": _cli_override(args.dropout, merged["model"].get("dropout")),
+    # ---------------------------------------------------------------------
+    # Training state
+    #   NOTE: train_loop expects `state['log']` to be a logger with .info()
+    #         Keep custom bookkeeping in `log_state`.
+    # ---------------------------------------------------------------------
+    state = dict(
+        model=student,
+        device=device,
+        teacher_name=teacher_name,
+        train_loader=train_dl,
+        val_loader=val_dl,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        save_every=save_every,
+        eval_every=eval_every,
+        log_interval=log_interval,
+        train_steps=train_steps,
+        output_prefix="",
+        ckptio=save_and_maybe_upload,
+        local_outdir=str(local_outdir),
+        gcs_outdir=gcs_outdir,
+        precision=precision,
+        step=step0,
+        micro_batch=micro_batch,
+        global_batch=global_batch,
+        # logger used by train_loop
+        log=get_logger("train"),
+        # optional bookkeeping for your own use
+        log_state={
+            "history": [],
+            "last_eval": None,
+            "running_loss": None,
         },
+    )
+
+    # ---------------------------------------------------------------------
+    # Train
+    # ---------------------------------------------------------------------
+    final_step = train_loop(state)
+
+    # ---------------------------------------------------------------------
+    # Final save
+    # ---------------------------------------------------------------------
+    sd = {
+        "model": student.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "step": final_step,
+        "tokenizer": getattr(tok, "name_or_path", None),
     }
-
-    if teacher_eval_every is not None:
-        cfg["teacher_eval_every"] = teacher_eval_every
-
-    return _ensure_jsonable(cfg)
-
-
-__all__ = ["parse_args"]
+    save_and_maybe_upload(sd, local_outdir, gcs_outdir, filename="final.pt")
+    log.info(f"Finished at step {final_step}.")
