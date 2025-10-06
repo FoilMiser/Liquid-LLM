@@ -132,12 +132,10 @@ def train_loop(state):
     device        = state["device"]
     teacher_name  = state["teacher_name"]
     kd_alpha      = state.get("kd_alpha", 0.5)
-    kd_temperature = state.get("kd_temperature", 1.0)
     train_loader  = state["train_loader"]
     val_loader    = state["val_loader"]
     optimizer     = state["optimizer"]
     scheduler     = state["scheduler"]
-    grad_clip     = state.get("grad_clip", 1.0)
     save_every    = state["save_every"]
     eval_every    = state["eval_every"]
     log           = state["log"]
@@ -203,7 +201,7 @@ def train_loop(state):
                 if teacher is not None and kd_alpha > 0:
                     with torch.no_grad():
                         logits_t = _get_logits(teacher(input_ids))
-                    T = kd_temperature
+                    T = 1.0
                     logprob_s = torch.nn.functional.log_softmax(logits_s / T, dim=-1)
                     prob_t    = torch.nn.functional.softmax(logits_t / T, dim=-1)
                     loss_kd   = torch.nn.functional.kl_div(
@@ -214,7 +212,7 @@ def train_loop(state):
                     loss = loss_ce
 
             scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
