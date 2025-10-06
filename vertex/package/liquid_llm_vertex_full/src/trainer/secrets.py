@@ -31,6 +31,7 @@ def _detect_project_id() -> Optional[str]:
 def ensure_hf_token(
     *,
     secret_name: str = "hf-token",
+    secret_names: Optional[Iterable[str]] = None,
     env_var: str = "HUGGING_FACE_HUB_TOKEN",
     log=None,
 ) -> str:
@@ -39,10 +40,11 @@ def ensure_hf_token(
     The precedence order is:
 
     1. Existing environment variables (``HUGGING_FACE_HUB_TOKEN``/``HF_TOKEN``)
-    2. Google Secret Manager secret ``secret_name`` in the active project
+    2. Google Secret Manager secrets in ``secret_names``/``secret_name`` order
 
     Args:
-        secret_name: Secret Manager identifier containing the HF access token.
+        secret_name: Default Secret Manager identifier containing the HF access token.
+        secret_names: Optional iterable of secret names to try (in order).
         env_var: Environment variable name to populate with the token.
         log: Optional logger with an ``info``/``warning`` method.
 
@@ -67,31 +69,53 @@ def ensure_hf_token(
             "Set the HUGGING_FACE_HUB_TOKEN environment variable or configure project metadata."
         )
 
+    candidates = list(secret_names or ())
+    if not candidates:
+        candidates.append(secret_name)
+    else:
+        # maintain backwards compatibility with the legacy default name if a
+        # single override was supplied.
+        if len(candidates) == 1 and candidates[0] in {"hf-token", "hf_token"}:
+            alt = "hf-token" if candidates[0] == "hf_token" else "hf_token"
+            candidates.append(alt)
+
+    # Ensure the default names are always attempted if not explicitly provided.
+    for fallback in ("hf_token", "hf-token"):
+        if fallback not in candidates:
+            candidates.append(fallback)
+
     client = secretmanager.SecretManagerServiceClient()
-    name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+    errors = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        name = f"projects/{project_id}/secrets/{candidate}/versions/latest"
+        try:
+            response = client.access_secret_version(name=name)
+        except Exception as exc:  # pragma: no cover - bubble up with context
+            errors.append((candidate, exc))
+            continue
 
-    try:
-        response = client.access_secret_version(name=name)
-    except Exception as exc:  # pragma: no cover - bubble up with context
-        raise RuntimeError(
-            f"Failed to access secret '{secret_name}' in project '{project_id}': {exc}"
-        ) from exc
+        token = response.payload.data.decode("utf-8").strip()
+        if not token:
+            errors.append((candidate, ValueError("secret payload empty")))
+            continue
 
-    token = response.payload.data.decode("utf-8").strip()
-    if not token:
-        raise RuntimeError(
-            f"Secret '{secret_name}' in project '{project_id}' is empty."
-        )
+        os.environ[env_var] = token
+        os.environ.setdefault("HF_TOKEN", token)
 
-    os.environ[env_var] = token
-    os.environ.setdefault("HF_TOKEN", token)
+        if log:
+            log.info(
+                "Loaded Hugging Face token from Secret Manager secret '%s' (project '%s').",
+                candidate,
+                project_id,
+            )
 
-    if log:
-        log.info(
-            "Loaded Hugging Face token from Secret Manager secret '%s' (project '%s').",
-            secret_name,
-            project_id,
-        )
+        return token
 
-    return token
+    details = ", ".join(f"{name}: {err}" for name, err in errors) or "no candidates"
+    raise RuntimeError(
+        "Failed to access any configured Hugging Face token secret. "
+        f"Tried: {', '.join(candidates)} (details: {details})"
+    )
 

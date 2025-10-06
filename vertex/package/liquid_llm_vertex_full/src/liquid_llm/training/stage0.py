@@ -59,9 +59,13 @@ def run_training(
     precision: str = "fp16",
     model: dict = None,
     hf_token: str | None = None,
+    hf_secret_name: str | None = None,
 ):
     log = get_logger("stage0")
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if hf_secret_name:
+        log.info(f"Using Hugging Face token from secret '{hf_secret_name}'.")
 
     # ---------------------------------------------------------------------
     # Seeding
