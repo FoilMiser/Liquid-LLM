@@ -30,6 +30,7 @@ def build_dataloaders(
     micro_batch: int = 4,
     num_workers: int = 2,
     seed: Optional[int] = None,
+    hf_token: Optional[str] = None,
     **_: dict,  # tolerate extra kwargs
 ) -> Tuple[DataLoader, DataLoader, int, int, AutoTokenizer]:
     # Seeding (no datasets.set_seed)
@@ -40,7 +41,8 @@ def build_dataloaders(
 
     raw: DatasetDict = load_dataset(dataset_name, dataset_config)
 
-    tok = AutoTokenizer.from_pretrained(teacher_name, use_fast=True)
+    auth_kwargs = {"token": hf_token} if hf_token else {}
+    tok = AutoTokenizer.from_pretrained(teacher_name, use_fast=True, **auth_kwargs)
     if tok.pad_token is None:
         if tok.eos_token is None:
             tok.add_special_tokens({"eos_token": "<|endoftext|>"})
