@@ -4,4 +4,5 @@
 --dataset_name=wikitext
 --dataset_config=wikitext-103-raw-v1
 --output_gcs_uri=gs://liquid-llm-bucket/liquid-llm/stage0/checkpoints/vertex_runs/$(date +%Y%m%d-%H%M%S)
---train_steps=600000
+
+--train_steps=1000000
