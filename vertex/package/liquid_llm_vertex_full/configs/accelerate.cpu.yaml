@@ -1,0 +1,4 @@
+compute_environment: LOCAL_MACHINE
+mixed_precision: "no"
+distributed_type: NO
+dynamo_backend: NO
