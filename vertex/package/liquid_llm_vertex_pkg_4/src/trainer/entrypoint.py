@@ -8,10 +8,13 @@ from liquid_llm.utils.seed import set_all_seeds
 from liquid_llm.training.stage0 import run_training
 
 def main(argv=None):
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     cfg = parse_args(argv)
     Path(cfg['local_workdir']).mkdir(parents=True, exist_ok=True)
     init_logger()
     log = get_logger('entrypoint')
+
+    log.info("[sys] TOKENIZERS_PARALLELISM=false")
 
     log.info(f"Parsed config: {cfg}")
     set_all_seeds(cfg['seed'])
