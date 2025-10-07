@@ -1,7 +1,9 @@
 import os
 import random
+import subprocess
 from pathlib import Path
 from datetime import datetime
+from importlib import metadata
 
 import numpy as np
 import torch
@@ -63,9 +65,6 @@ def run_training(
 ):
     log = get_logger("stage0")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if hf_secret_name:
-        log.info(f"Using Hugging Face token from secret '{hf_secret_name}'.")
 
     # ---------------------------------------------------------------------
     # Seeding
@@ -133,7 +132,6 @@ def run_training(
     if resume_gcs_uri:
         try:
             step0 = load_from_uri(student, optimizer, scheduler, resume_gcs_uri)
-            log.info(f"Resumed from {resume_gcs_uri} at step {step0}")
         except Exception as e:
             log.warning(f"Resume failed: {e}")
 
@@ -143,14 +141,36 @@ def run_training(
     local_outdir = Path(local_workdir) / "outputs"
     local_outdir.mkdir(parents=True, exist_ok=True)
     gcs_outdir = _expand_output_uri(output_gcs_uri)
-    if gcs_outdir:
-        log.info(f"Writing checkpoints to {gcs_outdir}")
 
     # ---------------------------------------------------------------------
     # Training state
     #   NOTE: train_loop expects `state['log']` to be a logger with .info()
     #         Keep custom bookkeeping in `log_state`.
     # ---------------------------------------------------------------------
+    try:
+        pkg_ver = metadata.version("liquid_llm_vertex_pkg_4")
+    except metadata.PackageNotFoundError:
+        pkg_ver = "unknown"
+
+    repo_root = None
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / ".git").exists():
+            repo_root = candidate
+            break
+    if repo_root is None:
+        repo_root = Path(__file__).resolve().parents[4]
+
+    try:
+        git_sha = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root)
+            .decode()
+            .strip()
+        )
+    except Exception:
+        git_sha = "unknown"
+
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{random.getrandbits(16):04x}"
+
     state = dict(
         model=student,
         device=device,
@@ -177,6 +197,13 @@ def run_training(
         dataset_name=dataset_name,
         val_split=val_split,
         grad_clip_norm=1.0,
+        seed=seed,
+        run_id=run_id,
+        run_meta={
+            "git_sha": git_sha,
+            "pkg_ver": pkg_ver,
+            "resume_uri": resume_gcs_uri,
+        },
         # logger used by train_loop
         log=get_logger("train"),
         # optional bookkeeping for your own use

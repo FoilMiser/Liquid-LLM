@@ -13,10 +13,6 @@ def main(argv=None):
     Path(cfg['local_workdir']).mkdir(parents=True, exist_ok=True)
     init_logger()
     log = get_logger('entrypoint')
-
-    log.info("[sys] TOKENIZERS_PARALLELISM=false")
-
-    log.info(f"Parsed config: {cfg}")
     set_all_seeds(cfg['seed'])
 
     token_kwargs = {

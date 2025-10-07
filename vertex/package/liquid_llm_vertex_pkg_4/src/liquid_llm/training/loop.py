@@ -1,19 +1,11 @@
 import time
-import statistics
-from collections import deque
-from enum import Enum
+import math
 from pathlib import Path
 from typing import Optional
 import torch
 from transformers import AutoModelForCausalLM
 from .metrics import cross_entropy, Meter
 from .evaluation import evaluate
-
-
-class LossAveraging(Enum):
-    PER_TOKEN = "per_tok"
-    PER_BATCH = "per_batch"
-
 
 def _format_float(value: float) -> str:
     if value == 0:
@@ -23,22 +15,6 @@ def _format_float(value: float) -> str:
     if digit_count < 3:
         formatted = f"{value:.3f}"
     return formatted
-
-
-def _format_loss(value: float, averaging: LossAveraging) -> str:
-    return f"{_format_float(value)} ({averaging.value})"
-
-
-def _format_bytes(num_bytes: int) -> str:
-    units = ["B", "KB", "MB", "GB", "TB"]
-    size = float(max(num_bytes, 0))
-    unit = units[0]
-    for u in units[1:]:
-        if size < 1024.0:
-            break
-        size /= 1024.0
-        unit = u
-    return f"{size:.2f}{unit}"
 
 
 def _update_ema(current: Optional[float], value: float, beta: float) -> float:
@@ -176,9 +152,7 @@ def _prune_files(files, keep_k: int | None, retention_secs: int | None, now: flo
                     log.warning(f"[ckpt] {label} prune skip {p}: {e}")
             survivors = survivors[len(survivors) - keep_k :]
 
-    if removed:
-        log.info(f"[ckpt] pruned {removed} old {label} checkpoints.")
-    return survivors
+    return survivors, removed
 
 
 def _prune_time_ckpts(local_outdir: str, log, retention_secs: int | None, keep_k: int | None, now: float | None = None):
@@ -187,7 +161,15 @@ def _prune_time_ckpts(local_outdir: str, log, retention_secs: int | None, keep_k
     """
     now = now or time.time()
     files = _list_sorted_by_mtime("ckpt_time_*.pt", local_outdir)
-    _prune_files(files, keep_k=keep_k, retention_secs=retention_secs, now=now, log=log, label="time-based")
+    _, removed = _prune_files(
+        files,
+        keep_k=keep_k,
+        retention_secs=retention_secs,
+        now=now,
+        log=log,
+        label="time-based",
+    )
+    return removed
 
 
 def _prune_best_ckpts(local_outdir: str, log, retention_secs: int | None, keep_k: int | None, now: float | None = None):
@@ -198,8 +180,16 @@ def _prune_best_ckpts(local_outdir: str, log, retention_secs: int | None, keep_k
     now = now or time.time()
     files = _list_sorted_by_mtime("ckpt_best_*.pt", local_outdir)
     if not files:
-        return
-    _prune_files(files, keep_k=keep_k, retention_secs=retention_secs, now=now, log=log, label="best")
+        return 0
+    _, removed = _prune_files(
+        files,
+        keep_k=keep_k,
+        retention_secs=retention_secs,
+        now=now,
+        log=log,
+        label="best",
+    )
+    return removed
 
 
 def _prune_step_ckpts(local_outdir: str, log, retention_secs: int | None, keep_k: int | None, now: float | None = None):
@@ -209,8 +199,16 @@ def _prune_step_ckpts(local_outdir: str, log, retention_secs: int | None, keep_k
     now = now or time.time()
     files = _list_sorted_by_mtime("ckpt_step_*.pt", local_outdir)
     if not files:
-        return
-    _prune_files(files, keep_k=keep_k, retention_secs=retention_secs, now=now, log=log, label="step-based")
+        return 0
+    _, removed = _prune_files(
+        files,
+        keep_k=keep_k,
+        retention_secs=retention_secs,
+        now=now,
+        log=log,
+        label="step-based",
+    )
+    return removed
 
 
 def train_loop(state):
@@ -235,9 +233,21 @@ def train_loop(state):
     pad_id        = state.get("pad_id")
     grad_clip_norm = float(state.get("grad_clip_norm", 1.0))
     loss_ema_beta = float(state.get("loss_ema_beta", 0.9))
-    ema_window = max(min(int(round(1.0 / max(1.0 - loss_ema_beta, 1e-6))), 10000), 1)
     dataset_name = state.get("dataset_name", "unknown")
     val_split_name = state.get("val_split", "validation")
+    seed_value = state.get("seed", "unknown")
+    run_id = state.get("run_id", "unknown")
+    run_meta = state.get("run_meta", {})
+    world_size = 1
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            world_size = torch.distributed.get_world_size()
+        except Exception:
+            world_size = 1
+    global_batch = state.get("global_batch") or getattr(train_loader, "batch_size", None)
+    if global_batch is None:
+        global_batch = state.get("micro_batch", "n/a")
+    seq_len = block_size if block_size is not None else "n/a"
 
     # --- Time-based checkpoint cadence & retention ---
     time_ckpt_secs            = int(state.get("time_ckpt_secs", 1800))            # every 30 min by default
@@ -263,17 +273,6 @@ def train_loop(state):
     best_val_loss = float(state.get("best_val_loss", float("inf")))
     best_path_local = None
 
-    def _cuda_mem_strings():
-        if not torch.cuda.is_available():
-            return "0.00GB", "0.00GB"
-        try:
-            device_idx = torch.cuda.current_device()
-            alloc = torch.cuda.memory_allocated(device_idx) / (1024 ** 3)
-            reserved = torch.cuda.memory_reserved(device_idx) / (1024 ** 3)
-            return f"{alloc:.2f}GB", f"{reserved:.2f}GB"
-        except Exception:
-            return "N/A", "N/A"
-
     # Optional teacher (for KD)
     teacher = None
     teacher_metrics = None
@@ -281,45 +280,28 @@ def train_loop(state):
     teacher_eval_error = None
     if kd_alpha and kd_alpha > 0:
         auth_kwargs = {"token": hf_token} if hf_token else {}
-        log.info(f"Loading teacher model '{teacher_name}' for knowledge distillation.")
         try:
             teacher = AutoModelForCausalLM.from_pretrained(teacher_name, **auth_kwargs).to(device).eval()
-            params_list = list(teacher.parameters())
-            for p in params_list:
+            for p in teacher.parameters():
                 p.requires_grad_(False)
-            first_param = params_list[0] if params_list else None
-            teacher_device = str(first_param.device) if first_param is not None else str(device)
-            teacher_dtype = str(first_param.dtype) if first_param is not None else "unknown"
-            num_params = sum(int(p.numel()) for p in params_list)
-            seq_len = block_size if block_size is not None else "n/a"
-            batch_size = getattr(train_loader, "batch_size", None)
-            if batch_size is None:
-                batch_size = state.get("micro_batch", "n/a")
-            log_stats(
-                log,
-                "KD",
-                teacher=teacher_name,
-                device=teacher_device,
-                dtype=teacher_dtype,
-                params=f"{num_params:,}",
-                seq=seq_len,
-                bs=batch_size,
-                T=_format_float(kd_temperature),
-                alpha=f"{kd_alpha:.2f}",
-                kl_scale="T^2",
-            )
 
             try:
+                teacher_eval_t0 = time.time()
                 teacher_metrics = evaluate(teacher, val_loader, device=device)
+                teacher_eval_time = time.time() - teacher_eval_t0
                 teacher.eval()  # ensure eval mode retained after evaluation helper
                 log_stats(
                     log,
                     "eval",
                     step=0,
-                    val_loss_student="—",
-                    ppl_student="—",
+                    dataset=dataset_name,
+                    split=val_split_name,
+                    tokens=teacher_metrics.get("tokens", "n/a"),
+                    val_loss_student="na",
+                    ppl_student="na",
                     val_loss_teacher=_format_float(teacher_metrics["val_loss"]),
                     ppl_teacher=_format_float(teacher_metrics["val_ppl"]),
+                    t_eval=_format_float(teacher_eval_time),
                 )
             except Exception as eval_exc:  # pragma: no cover - defensive logging
                 teacher_eval_error = eval_exc
@@ -347,6 +329,26 @@ def train_loop(state):
             raise RuntimeError(msg) from teacher_eval_error
 
     kd_active = teacher is not None and kd_alpha > 0
+    initial_kd_scheme = "forward_kl" if kd_active else "off"
+
+    run_fields = {
+        "run_id": run_id,
+        "git_sha": run_meta.get("git_sha", "unknown"),
+        "pkg_ver": run_meta.get("pkg_ver", "unknown"),
+        "seed": seed_value,
+        "device": device,
+        "world_size": world_size,
+        "precision": precision,
+        "dataset": dataset_name,
+        "seq_len": seq_len,
+        "batch": global_batch,
+        "teacher": teacher_name,
+        "alpha": _format_float(kd_alpha),
+        "T": _format_float(kd_temperature),
+        "kd_scheme": initial_kd_scheme,
+        "kl_scale": "T^2",
+    }
+    log_stats(log, "run", **run_fields)
 
     if teacher_metrics is not None:
         state["teacher_metrics"] = teacher_metrics
@@ -355,26 +357,35 @@ def train_loop(state):
     step = state.get("step", 0)
     scaler = torch.amp.GradScaler("cuda", enabled=(precision == "fp16"))
 
+    kd_params_last = None
+
+    def maybe_log_kd_params(step_idx: int):
+        nonlocal kd_params_last
+        current_kd_alpha = float(state.get("kd_alpha", kd_alpha))
+        current_kd_temperature = float(state.get("kd_temperature", kd_temperature))
+        scheme = "forward_kl" if (teacher is not None and current_kd_alpha > 0) else "off"
+        current = (current_kd_alpha, current_kd_temperature, scheme)
+        if current != kd_params_last:
+            log_stats(
+                log,
+                "kd-hparams",
+                step=step_idx,
+                alpha=_format_float(current_kd_alpha),
+                T=_format_float(current_kd_temperature),
+                scheme=scheme,
+            )
+            kd_params_last = current
+
+    maybe_log_kd_params(step)
+
     # Meters for logging
     tok_meter = Meter()
-    batch_meter = Meter()
     ce_tok_meter = Meter()
-    ce_seq_meter = Meter()
     kd_tok_meter = Meter()
-    kd_seq_meter = Meter()
-    total_seq_meter = Meter()
     divergence_meter = Meter()
     logit_delta_meter = Meter()
     entropy_student_meter = Meter()
     entropy_teacher_meter = Meter()
-
-    distill_history = deque(maxlen=500)
-    total_loss_history = deque(maxlen=1000)
-
-    last_plateau_warn_step = None
-    last_spike_warn_step = None
-    last_teacher_var_warn_step = None
-    last_student_var_warn_step = None
 
     since_log_tokens = 0
     since_log_total_tokens = 0
@@ -385,6 +396,11 @@ def train_loop(state):
     attn_mask_elems_since_log = 0
     t0 = time.time()
     start_time = t0  # for first time-based ckpt window
+    step_time_accum = 0.0
+    ckpt_time_accum = 0.0
+    watchdog_interval = 100
+    grad_clipped_count_cum = 0
+    nan_inf_since_watchdog = False
 
     tokens_seen_total = int(state.get("tokens_seen_total", 0))
     examples_seen_total = int(state.get("examples_seen_total", 0))
@@ -392,61 +408,21 @@ def train_loop(state):
     ema_kd_tok = state.get("ema_kd_tok")
     ema_total_tok = state.get("ema_total_tok")
 
-    last_teacher_stats: Optional[dict] = None
-    last_student_stats: Optional[dict] = None
     last_top1_match = None
     last_top5_match = None
     last_logprob_corr = None
     last_grad_norm = None
     last_clip_triggered = False
-    last_total_loss_value = None
-
-    perf_totals = {
-        "loader": 0.0,
-        "student": 0.0,
-        "teacher": 0.0,
-        "kd": 0.0,
-        "step": 0.0,
-    }
-    ckpt_time_accum = 0.0
-
-    cuda_alloc, cuda_reserved = _cuda_mem_strings()
-    current_lr = optimizer.param_groups[0].get("lr", 0.0) if optimizer.param_groups else 0.0
-    log_stats(
-        log,
-        "opt",
-        step=0,
-        lr=f"{current_lr:.6g}",
-        grad_norm="—",
-        clipped=f"NO({_format_float(grad_clip_norm)})",
-        amp_scale=f"{scaler.get_scale():.3f}",
-        cuda_mem_alloc=cuda_alloc,
-        cuda_mem_reserved=cuda_reserved,
-    )
-
-    kd_scheme = "forward_kl" if kd_active else "off"
-    kd_params_last = (float(kd_alpha), float(kd_temperature), kd_scheme)
-    log_stats(
-        log,
-        "kd-hparams",
-        alpha=_format_float(kd_alpha),
-        T=_format_float(kd_temperature),
-        scheme=kd_scheme,
-    )
 
     model.train()
     train_iter = iter(train_loader)
 
     while step < total_steps:
-        loader_t0 = time.time()
         try:
             batch = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
-            loader_t0 = time.time()
             batch = next(train_iter)
-        loader_time = time.time() - loader_t0
-        perf_totals["loader"] += loader_time
 
         step += 1
         since_log_steps += 1
@@ -455,17 +431,7 @@ def train_loop(state):
         current_kd_temperature = float(state.get("kd_temperature", kd_temperature))
         kd_active_step = teacher is not None and current_kd_alpha > 0
         kd_scheme_step = "forward_kl" if kd_active_step else "off"
-        current_params = (float(current_kd_alpha), float(current_kd_temperature), kd_scheme_step)
-        if current_params != kd_params_last:
-            log_stats(
-                log,
-                "kd-hparams",
-                step=step,
-                alpha=_format_float(current_kd_alpha),
-                T=_format_float(current_kd_temperature),
-                scheme=kd_scheme_step,
-            )
-            kd_params_last = current_params
+        maybe_log_kd_params(step)
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
@@ -480,25 +446,13 @@ def train_loop(state):
             pad_tokens_since_log += int((input_ids == pad_id).sum().item())
 
         step_start = time.time()
-        teacher_time = 0.0
-        kd_time = 0.0
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=(precision == "fp16")):
-            student_start = time.time()
             logits_s = _get_logits(model(input_ids))
             loss_ce = cross_entropy(logits_s, labels)
-            student_time = time.time() - student_start
-            perf_totals["student"] += student_time
 
             logits_s_detached = logits_s.detach()
-            student_logits_stats = {
-                "mean": float(logits_s_detached.float().mean()),
-                "std": float(torch.std(logits_s_detached.float(), unbiased=False)),
-                "max": float(logits_s_detached.max()),
-                "min": float(logits_s_detached.min()),
-            }
-            last_student_stats = student_logits_stats
 
             loss_kd = None
             reverse_kd = 0.0
@@ -509,11 +463,8 @@ def train_loop(state):
             teacher_entropy_sum = 0.0
 
             if kd_active_step:
-                teacher_t0 = time.time()
                 with torch.no_grad():
                     logits_t = _get_logits(teacher(input_ids))
-                teacher_time = time.time() - teacher_t0
-                perf_totals["teacher"] += teacher_time
 
                 if logits_t.shape != logits_s.shape:
                     raise RuntimeError(
@@ -522,14 +473,6 @@ def train_loop(state):
                     )
 
                 with torch.no_grad():
-                    teacher_logits_stats = {
-                        "mean": float(logits_t.float().mean()),
-                        "std": float(torch.std(logits_t.float(), unbiased=False)),
-                        "max": float(logits_t.max()),
-                        "min": float(logits_t.min()),
-                    }
-                    last_teacher_stats = teacher_logits_stats
-
                     match_tensor = (
                         logits_s_detached.argmax(dim=-1) == logits_t.argmax(dim=-1)
                     ).float().mean()
@@ -542,23 +485,6 @@ def train_loop(state):
                         overlap = torch.isin(teacher_topk, student_topk)
                         top5_match_value = float(overlap.float().mean().item())
 
-                    if teacher_logits_stats["std"] < 1.0 and (
-                        last_teacher_var_warn_step is None or step - last_teacher_var_warn_step >= log_interval
-                    ):
-                        log.warning(
-                            f"[warn] step={step} teacher logits std low ({_format_float(teacher_logits_stats['std'])})"
-                        )
-                        last_teacher_var_warn_step = step
-
-                    if student_logits_stats["std"] < 0.5 and (
-                        last_student_var_warn_step is None or step - last_student_var_warn_step >= log_interval
-                    ):
-                        log.warning(
-                            f"[warn] step={step} student logits std low ({_format_float(student_logits_stats['std'])})"
-                        )
-                        last_student_var_warn_step = step
-
-                kd_start = time.time()
                 logprob_s_temp = torch.nn.functional.log_softmax(
                     logits_s / current_kd_temperature, dim=-1
                 )
@@ -568,8 +494,6 @@ def train_loop(state):
                 loss_kd = torch.nn.functional.kl_div(
                     logprob_s_temp, prob_t, reduction="batchmean"
                 ) * (current_kd_temperature * current_kd_temperature)
-                kd_time = time.time() - kd_start
-                perf_totals["kd"] += kd_time
 
                 with torch.no_grad():
                     logprob_t_temp = torch.nn.functional.log_softmax(
@@ -617,6 +541,12 @@ def train_loop(state):
         reverse_kd_value = float(reverse_kd)
         mse_logits_value = float(mse_logits)
         total_loss_value = float(loss.detach())
+        if (
+            not math.isfinite(total_loss_value)
+            or not math.isfinite(loss_ce_value)
+            or (kd_active_step and loss_kd is not None and not math.isfinite(loss_kd_value))
+        ):
+            nan_inf_since_watchdog = True
 
         scaler.scale(loss).backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
@@ -624,32 +554,24 @@ def train_loop(state):
         last_clip_triggered = bool(
             grad_norm is not None and last_grad_norm is not None and last_grad_norm > grad_clip_norm + 1e-6
         )
+        if last_grad_norm is not None and not math.isfinite(last_grad_norm):
+            nan_inf_since_watchdog = True
+        if last_clip_triggered:
+            grad_clipped_count_cum += 1
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
-        amp_scale_value = scaler.get_scale()
 
         tokens_in_batch = input_ids.numel()
         contrib_tokens = _count_tokens(labels, tokens_in_batch)
         batch_size = input_ids.size(0)
 
         tok_meter.update(total_loss_value, k=contrib_tokens)
-        batch_meter.update(total_loss_value, k=batch_size)
         ce_tok_meter.update(loss_ce_value, k=contrib_tokens)
-        ce_seq_meter.update(
-            loss_ce_value * contrib_tokens / max(batch_size, 1), k=batch_size
-        )
-        total_seq_meter.update(
-            total_loss_value * contrib_tokens / max(batch_size, 1), k=batch_size
-        )
         if kd_active_step and loss_kd is not None:
             kd_tok_meter.update(loss_kd_value, k=contrib_tokens)
-            kd_seq_meter.update(
-                loss_kd_value * contrib_tokens / max(batch_size, 1), k=batch_size
-            )
             divergence_meter.update(reverse_kd_value, k=contrib_tokens)
             logit_delta_meter.update(mse_logits_value, k=contrib_tokens)
-            distill_history.append(loss_kd_value)
         else:
             ema_kd_tok = None
         if logprob_corr_value is not None:
@@ -667,9 +589,6 @@ def train_loop(state):
                 teacher_entropy_sum / max(contrib_tokens, 1), k=contrib_tokens
             )
 
-        total_loss_history.append(total_loss_value)
-        last_total_loss_value = total_loss_value
-
         since_log_tokens += contrib_tokens
         since_log_examples += batch_size
         tokens_seen_total += contrib_tokens
@@ -681,200 +600,69 @@ def train_loop(state):
             ema_kd_tok = _update_ema(ema_kd_tok, loss_kd_value, loss_ema_beta)
 
         step_time = time.time() - step_start
-        perf_totals["step"] += step_time
+        step_time_accum += step_time
 
         if step % log_interval == 0:
             elapsed = max(time.time() - t0, 1e-9)
             tok_per_sec = since_log_tokens / elapsed
             ex_per_sec = since_log_examples / max(elapsed, 1e-9)
-            avg_seq_len = since_log_tokens / max(since_log_examples, 1)
-            avg_batch = since_log_examples / max(since_log_steps, 1)
-
-            cuda_alloc, cuda_reserved = _cuda_mem_strings()
-            current_lr = (
-                optimizer.param_groups[0].get("lr", 0.0)
-                if optimizer.param_groups
-                else 0.0
-            )
-            grad_display = "—" if last_grad_norm is None else f"{last_grad_norm:.3f}"
-            clipped_display = "YES" if last_clip_triggered else "NO"
-            log_stats(
-                log,
-                "opt",
-                step=step,
-                lr=f"{current_lr:.6g}",
-                grad_norm=grad_display,
-                clipped=f"{clipped_display}({_format_float(grad_clip_norm)})",
-                amp_scale=f"{amp_scale_value:.3f}",
-                cuda_mem_alloc=cuda_alloc,
-                cuda_mem_reserved=cuda_reserved,
-            )
-
-            log_stats(
-                log,
-                "kd-hparams",
-                step=step,
-                alpha=_format_float(current_kd_alpha),
-                T=_format_float(current_kd_temperature),
-                scheme=kd_scheme_step,
-            )
-
-            kd_tok_avg = kd_tok_meter.avg if kd_tok_meter.n else None
-            kd_seq_avg = kd_seq_meter.avg if kd_seq_meter.n else None
-            loss_stats = {
-                "step": step,
-                "ce_seq": _format_float(ce_seq_meter.avg),
-                "ce_tok": _format_float(ce_tok_meter.avg),
-                "kd_seq": _format_float(kd_seq_avg) if kd_seq_avg is not None else "—",
-                "kd_tok": _format_float(kd_tok_avg) if kd_tok_avg is not None else "—",
-                "total_seq": _format_float(total_seq_meter.avg),
-                "total_tok": _format_float(tok_meter.avg),
-                "seq_len": _format_float(avg_seq_len),
-                "batch": _format_float(avg_batch),
-                "reduction": "mean_over(batch,seq)",
-                "base": "e",
-            }
-            log_stats(log, "loss", **loss_stats)
-
-            entropy_stats = {
-                "step": step,
-                "H_student": _format_float(entropy_student_meter.avg),
-                "H_teacher": _format_float(entropy_teacher_meter.avg) if entropy_teacher_meter.n else "—",
-                "base": "e",
-            }
-            log_stats(log, "entropy", **entropy_stats)
-
-            counter_stats = {
-                "step": step,
-                "tokens_seen": tokens_seen_total,
-                "examples_seen": examples_seen_total,
-                "steps": step,
-            }
-            log_stats(log, "counter", **counter_stats)
-
-            loss_ema_stats = {
-                "step": step,
-                "ce_tok": _format_float(ema_ce_tok) if ema_ce_tok is not None else "—",
-                "kd_tok": _format_float(ema_kd_tok) if ema_kd_tok is not None else "—",
-                "total_tok": _format_float(ema_total_tok) if ema_total_tok is not None else "—",
-                "window": f"ema@{ema_window} steps",
-            }
-            log_stats(log, "loss-ema", **loss_ema_stats)
-
+            avg_step = step_time_accum / max(since_log_steps, 1)
             pad_frac = pad_tokens_since_log / max(since_log_total_tokens, 1)
             attn_cov = (
                 attn_mask_ones_since_log / max(attn_mask_elems_since_log, 1)
                 if attn_mask_elems_since_log
                 else None
             )
-            data_stats = {
+            current_lr = (
+                optimizer.param_groups[0].get("lr", 0.0)
+                if optimizer.param_groups
+                else 0.0
+            )
+            grad_display = "na" if last_grad_norm is None else _format_float(last_grad_norm)
+            clipped_display = "YES" if last_clip_triggered else "NO"
+            ce_tok_avg = ce_tok_meter.avg if ce_tok_meter.n else 0.0
+            kd_tok_avg = kd_tok_meter.avg if kd_tok_meter.n else 0.0
+            total_tok_avg = tok_meter.avg if tok_meter.n else 0.0
+            kl_rev_avg = divergence_meter.avg if divergence_meter.n else None
+            mse_avg = logit_delta_meter.avg if logit_delta_meter.n else None
+            H_student_avg = entropy_student_meter.avg if entropy_student_meter.n else 0.0
+            H_teacher_avg = entropy_teacher_meter.avg if entropy_teacher_meter.n else None
+            corr_value = last_logprob_corr
+            top1_value = last_top1_match
+            top5_value = last_top5_match
+            eff_kd = current_kd_alpha * (current_kd_temperature * current_kd_temperature)
+
+            train_stats = {
                 "step": step,
+                "tokens_seen": tokens_seen_total,
+                "lr": _format_float(current_lr),
+                "grad_norm": grad_display,
+                "clipped": clipped_display,
+                "ce_tok": _format_float(ce_tok_avg),
+                "kd_tok": _format_float(kd_tok_avg) if kd_tok_meter.n else "na",
+                "total_tok": _format_float(total_tok_avg),
+                "alpha": _format_float(current_kd_alpha),
+                "T": _format_float(current_kd_temperature),
+                "eff_kd": _format_float(eff_kd),
+                "kl_fwd": _format_float(kd_tok_avg) if kd_tok_meter.n else "na",
+                "kl_rev": _format_float(kl_rev_avg) if kl_rev_avg is not None else "na",
+                "mse": _format_float(mse_avg) if mse_avg is not None else "na",
+                "H_student": _format_float(H_student_avg),
+                "H_teacher": _format_float(H_teacher_avg) if H_teacher_avg is not None else "na",
+                "top1": _format_float(top1_value) if top1_value is not None else "na",
+                "top5": _format_float(top5_value) if top5_value is not None else "na",
+                "corr_t_s": _format_float(corr_value) if corr_value is not None else "na",
                 "pad_frac": _format_float(pad_frac),
-                "attn_mask_coverage": _format_float(attn_cov) if attn_cov is not None else "n/a",
+                "attn_mask_coverage": _format_float(attn_cov) if attn_cov is not None else "na",
+                "t_step": _format_float(avg_step),
+                "tok/s": _format_float(tok_per_sec),
+                "ex/s": _format_float(ex_per_sec),
             }
-            log_stats(log, "data", **data_stats)
-
-            if kd_tok_meter.n:
-                log_stats(
-                    log,
-                    "divergence",
-                    step=step,
-                    kl_forward=_format_float(kd_tok_meter.avg),
-                    kl_reverse=_format_float(divergence_meter.avg),
-                    mse=_format_float(logit_delta_meter.avg),
-                    base="e",
-                    T=_format_float(current_kd_temperature),
-                )
-
-            if last_teacher_stats:
-                log_stats(
-                    log,
-                    "logits",
-                    prefix="teacher",
-                    mean=last_teacher_stats["mean"],
-                    std=last_teacher_stats["std"],
-                    max=last_teacher_stats["max"],
-                    min=last_teacher_stats["min"],
-                )
-            if last_student_stats:
-                log_stats(
-                    log,
-                    "logits",
-                    prefix="student",
-                    mean=last_student_stats["mean"],
-                    std=last_student_stats["std"],
-                    max=last_student_stats["max"],
-                    min=last_student_stats["min"],
-                )
-
-            if teacher and (last_top1_match is not None or last_top5_match is not None or last_logprob_corr is not None):
-                align_stats = {
-                    "step": step,
-                    "top1": _format_float(last_top1_match) if last_top1_match is not None else "—",
-                    "top5": _format_float(last_top5_match) if last_top5_match is not None else "—",
-                    "corr(logp_t,logp_s)": _format_float(last_logprob_corr) if last_logprob_corr is not None else "—",
-                }
-                log_stats(log, "align", **align_stats)
-
-            avg_loader = perf_totals["loader"] / max(since_log_steps, 1)
-            avg_teacher = perf_totals["teacher"] / max(since_log_steps, 1)
-            avg_student = perf_totals["student"] / max(since_log_steps, 1)
-            avg_kd = perf_totals["kd"] / max(since_log_steps, 1)
-            avg_step = perf_totals["step"] / max(since_log_steps, 1)
-            avg_ckpt = ckpt_time_accum / max(since_log_steps, 1)
-            perf_stats = {
-                "step": step,
-                "t_step": f"{avg_step:.3f}s",
-                "t_loader": f"{avg_loader:.3f}s",
-                "t_teacher": f"{avg_teacher:.3f}s",
-                "t_student": f"{avg_student:.3f}s",
-                "t_kd": f"{avg_kd:.3f}s",
-                "t_ckpt": f"{avg_ckpt:.3f}s",
-                "tok/s": f"{tok_per_sec:.0f}",
-                "ex/s": f"{ex_per_sec:.1f}",
-            }
-            log_stats(log, "perf", **perf_stats)
-
-            if kd_active_step and len(distill_history) == distill_history.maxlen:
-                values = list(distill_history)
-                mid = len(values) // 2
-                first_med = statistics.median(values[:mid]) if mid else statistics.median(values)
-                second_med = statistics.median(values[mid:]) if mid else statistics.median(values)
-                reduction = (first_med - second_med) / max(abs(first_med), 1e-8)
-                if reduction < 0.01 and (
-                    last_plateau_warn_step is None or step - last_plateau_warn_step >= log_interval
-                ):
-                    log.warning(
-                        f"[warn] step={step} distill_loss plateaued for {len(values)} steps (Δ < 1%)"
-                    )
-                    last_plateau_warn_step = step
-
-            if total_loss_history:
-                best_window = min(total_loss_history)
-                if (
-                    best_window > 0
-                    and last_total_loss_value is not None
-                    and last_total_loss_value > 1.5 * best_window
-                    and (
-                        last_spike_warn_step is None
-                        or step - last_spike_warn_step >= log_interval
-                    )
-                ):
-                    log.warning(
-                        "[warn] step=%s total_loss spiked (current=%.3f, best_window=%.3f)",
-                        step,
-                        last_total_loss_value,
-                        best_window,
-                    )
-                    last_spike_warn_step = step
+            log_stats(log, "train", **train_stats)
 
             tok_meter = Meter()
-            batch_meter = Meter()
             ce_tok_meter = Meter()
-            ce_seq_meter = Meter()
             kd_tok_meter = Meter()
-            kd_seq_meter = Meter()
-            total_seq_meter = Meter()
             divergence_meter = Meter()
             logit_delta_meter = Meter()
             entropy_student_meter = Meter()
@@ -886,10 +674,18 @@ def train_loop(state):
             pad_tokens_since_log = 0
             attn_mask_ones_since_log = 0
             attn_mask_elems_since_log = 0
-            for key in perf_totals:
-                perf_totals[key] = 0.0
-            ckpt_time_accum = 0.0
+            step_time_accum = 0.0
             t0 = time.time()
+
+        if step % watchdog_interval == 0:
+            log_stats(
+                log,
+                "watchdog",
+                step=step,
+                nan_inf_found="YES" if nan_inf_since_watchdog else "NO",
+                grad_clipped_count_cum=grad_clipped_count_cum,
+            )
+            nan_inf_since_watchdog = False
 
         kd_alpha = current_kd_alpha
         kd_temperature = current_kd_temperature
@@ -908,18 +704,13 @@ def train_loop(state):
                 "step": step,
                 "dataset": dataset_name,
                 "split": val_split_name,
-                "batches": metrics.get("batches", "n/a"),
-                "examples": metrics.get("examples", "n/a"),
                 "tokens": metrics.get("tokens", "n/a"),
-                "t_eval": f"{eval_time:.2f}s",
-                "loss": _format_float(val_loss),
-                "ppl": _format_float(metrics["val_ppl"]),
                 "val_loss_student": _format_float(val_loss),
                 "ppl_student": _format_float(metrics["val_ppl"]),
+                "val_loss_teacher": _format_float(teacher_metrics["val_loss"]) if teacher_metrics else "na",
+                "ppl_teacher": _format_float(teacher_metrics["val_ppl"]) if teacher_metrics else "na",
+                "t_eval": _format_float(eval_time),
             }
-            if teacher_metrics:
-                eval_stats["val_loss_teacher"] = _format_float(teacher_metrics["val_loss"])
-                eval_stats["ppl_teacher"] = _format_float(teacher_metrics["val_ppl"])
             log_stats(log, "eval", **eval_stats)
 
             # New best? Save/overwrite best.pt and versioned best snapshot
@@ -955,12 +746,11 @@ def train_loop(state):
                 log_stats(
                     log,
                     "ckpt",
-                    prefix="best",
+                    status="new_best",
                     step=step,
-                    size=_format_bytes(best_size),
-                    t_save=f"{best_time:.2f}s",
-                    prune=f"best(k={best_ckpt_keep_k},ret={best_ckpt_retention_secs})",
-                    uploaded="YES" if best_uri else "NO",
+                    val_loss_student=_format_float(val_loss),
+                    filename="best.pt",
+                    pruned_count=0,
                 )
 
                 # Versioned best snapshot for historical/top-K retention
@@ -981,18 +771,18 @@ def train_loop(state):
                 log_stats(
                     log,
                     "ckpt",
-                    prefix="best-versioned",
+                    status="best_versioned",
                     step=step,
-                    size=_format_bytes(vers_size),
-                    t_save=f"{vers_time:.2f}s",
-                    prune=f"best(k={best_ckpt_keep_k},ret={best_ckpt_retention_secs})",
+                    val_loss_student=_format_float(val_loss),
                     filename=vers_name,
+                    pruned_count=0,
                 )
 
                 # Prune older best checkpoints per policy
                 prune_t0 = time.time()
+                pruned_best_count = 0
                 try:
-                    _prune_best_ckpts(
+                    pruned_best_count = _prune_best_ckpts(
                         local_outdir=state["local_outdir"],
                         log=log,
                         keep_k=best_ckpt_keep_k,
@@ -1001,24 +791,27 @@ def train_loop(state):
                     )
                     prune_time = time.time() - prune_t0
                     ckpt_time_accum += prune_time
-                    log_stats(
-                        log,
-                        "ckpt",
-                        prefix="best-prune",
-                        step=step,
-                        prune=f"best(k={best_ckpt_keep_k},ret={best_ckpt_retention_secs})",
-                        t_prune=f"{prune_time:.2f}s",
-                    )
                 except Exception as e:
                     ckpt_time_accum += time.time() - prune_t0
                     log.warning(f"[ckpt] best prune error: {e}")
+                if pruned_best_count:
+                    log_stats(
+                        log,
+                        "ckpt",
+                        status="best_prune",
+                        step=step,
+                        val_loss_student=_format_float(val_loss),
+                        filename=vers_name,
+                        pruned_count=pruned_best_count,
+                    )
 
             model.train()
 
             # Step-based checkpointing
             if save_every > 0 and step % save_every == 0:
+                step_filename = f"ckpt_step_{step}.pt"
                 step_local, step_uri, step_ckpt_time, step_size = _save_ckpt(
-                    ckptio, state, step, filename=f"ckpt_step_{step}.pt", log=log
+                    ckptio, state, step, filename=step_filename, log=log
                 )
                 ckpt_time_accum += step_ckpt_time
                 state.setdefault("log_state", {}).setdefault("step_checkpoints", []).append(
@@ -1031,17 +824,16 @@ def train_loop(state):
                 log_stats(
                     log,
                     "ckpt",
-                    prefix="step",
+                    status="step",
                     step=step,
-                    size=_format_bytes(step_size),
-                    t_save=f"{step_ckpt_time:.2f}s",
-                    prune=f"step(k={step_ckpt_keep_k},ret={step_ckpt_retention_secs})",
-                    uploaded="YES" if step_uri else "NO",
+                    val_loss_student="na",
+                    filename=step_filename,
+                    pruned_count=0,
                 )
                 # Prune older step checkpoints per policy (age &/or count)
                 prune_t0 = time.time()
                 try:
-                    _prune_step_ckpts(
+                    pruned_step_count = _prune_step_ckpts(
                         local_outdir=state["local_outdir"],
                         log=log,
                         retention_secs=step_ckpt_retention_secs,
@@ -1050,14 +842,16 @@ def train_loop(state):
                     )
                     prune_time = time.time() - prune_t0
                     ckpt_time_accum += prune_time
-                    log_stats(
-                        log,
-                        "ckpt",
-                        prefix="step-prune",
-                        step=step,
-                        prune=f"step(k={step_ckpt_keep_k},ret={step_ckpt_retention_secs})",
-                        t_prune=f"{prune_time:.2f}s",
-                    )
+                    if pruned_step_count:
+                        log_stats(
+                            log,
+                            "ckpt",
+                            status="step_prune",
+                            step=step,
+                            val_loss_student="na",
+                            filename=step_filename,
+                            pruned_count=pruned_step_count,
+                        )
                 except Exception as e:
                     ckpt_time_accum += time.time() - prune_t0
                     log.warning(f"[ckpt] step prune error: {e}")
@@ -1083,12 +877,11 @@ def train_loop(state):
                 log_stats(
                     log,
                     "ckpt",
-                    prefix="time",
+                    status="time",
                     step=step,
-                    size=_format_bytes(time_size),
-                    t_save=f"{time_elapsed:.2f}s",
-                    prune=f"time(k={time_ckpt_keep_k},ret={time_ckpt_retention_secs})",
+                    val_loss_student="na",
                     filename=fname,
+                    pruned_count=0,
                 )
                 last_time_ckpt_ts = now_ts
                 state["last_time_ckpt_ts"] = last_time_ckpt_ts  # persist within this run
@@ -1096,7 +889,7 @@ def train_loop(state):
                 # Prune older time-based checkpoints to save disk
                 prune_t0 = time.time()
                 try:
-                    _prune_time_ckpts(
+                    pruned_time_count = _prune_time_ckpts(
                         local_outdir=state["local_outdir"],
                         log=log,
                         retention_secs=time_ckpt_retention_secs,
@@ -1105,14 +898,16 @@ def train_loop(state):
                     )
                     prune_time = time.time() - prune_t0
                     ckpt_time_accum += prune_time
-                    log_stats(
-                        log,
-                        "ckpt",
-                        prefix="time-prune",
-                        step=step,
-                        prune=f"time(k={time_ckpt_keep_k},ret={time_ckpt_retention_secs})",
-                        t_prune=f"{prune_time:.2f}s",
-                    )
+                    if pruned_time_count:
+                        log_stats(
+                            log,
+                            "ckpt",
+                            status="time_prune",
+                            step=step,
+                            val_loss_student="na",
+                            filename=fname,
+                            pruned_count=pruned_time_count,
+                        )
                 except Exception as e:
                     ckpt_time_accum += time.time() - prune_t0
                     log.warning(f"[ckpt] time prune error: {e}")
