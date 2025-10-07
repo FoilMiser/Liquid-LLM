@@ -16,10 +16,16 @@ def main(argv=None):
     log.info(f"Parsed config: {cfg}")
     set_all_seeds(cfg['seed'])
 
+    token_kwargs = {
+        'token_value': cfg.pop('hf_token_value', None),
+        'token_file': cfg.pop('hf_token_file', None),
+        'token_gcs_uri': cfg.pop('hf_token_gcs_uri', None),
+    }
+
     secret_names = None
     if cfg.get('hf_secret_name'):
         secret_names = [cfg['hf_secret_name']]
-    hf_token = ensure_hf_token(secret_names=secret_names, log=log)
+    hf_token = ensure_hf_token(secret_names=secret_names, log=log, **token_kwargs)
     cfg['hf_token'] = hf_token
 
     run_training(**cfg)
