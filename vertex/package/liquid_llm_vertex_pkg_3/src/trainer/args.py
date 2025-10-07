@@ -11,6 +11,12 @@ def get_parser():
     p.add_argument('--dataset_config', type=str, required=True)
     p.add_argument('--hf_secret_name', type=str, default=None,
                    help='Secret Manager name containing the Hugging Face token')
+    p.add_argument('--hf_token_value', type=str, default=None,
+                   help='Explicit Hugging Face token value (takes precedence over secrets)')
+    p.add_argument('--hf_token_file', type=str, default=None,
+                   help='Path to a file containing the Hugging Face token')
+    p.add_argument('--hf_token_gcs_uri', type=str, default=None,
+                   help='GCS URI to a file containing the Hugging Face token')
 
     # Outputs
     p.add_argument('--output_gcs_uri', type=str, default=None)
@@ -65,6 +71,9 @@ def parse_args(argv=None):
         'output_gcs_uri': args.output_gcs_uri,
         'local_workdir': args.local_workdir,
         'hf_secret_name': o('hf_secret_name', merged.get('hf_secret_name')),
+        'hf_token_value': o('hf_token_value', merged.get('hf_token_value')),
+        'hf_token_file': o('hf_token_file', merged.get('hf_token_file')),
+        'hf_token_gcs_uri': o('hf_token_gcs_uri', merged.get('hf_token_gcs_uri')),
         'seed': o('seed', merged.get('seed', 42)),
         'global_batch': o('global_batch', merged.get('global_batch', 64)),
         'micro_batch': o('micro_batch', merged.get('micro_batch', 8)),

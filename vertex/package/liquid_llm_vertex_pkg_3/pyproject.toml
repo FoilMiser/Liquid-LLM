@@ -3,7 +3,7 @@ requires = ["setuptools>=69", "wheel", "build"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "liquid_llm_vertex"
+name = "liquid_llm_vertex_pkg_3"
 version = "0.0.1"
 description = "Vertex AI custom training package for Liquid-LLM Stage 0"
 readme = "README.md"
