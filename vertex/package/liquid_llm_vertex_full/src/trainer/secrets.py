@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Iterable, Optional
+from urllib.parse import urlparse
 
 import google.auth
 from google.api_core import exceptions as gcloud_exceptions
 from google.auth import exceptions as auth_exceptions
 from google.cloud import secretmanager
+from google.cloud import storage
 
 
 _PROJECT_ENV_VARS: Iterable[str] = (
@@ -54,11 +57,44 @@ def _build_secret_client(log=None):
     return client, project_from_creds
 
 
+def _load_token_from_gcs(uri: str, *, log=None) -> str:
+    """Load a token string from a GCS object."""
+
+    parsed = urlparse(uri)
+    if parsed.scheme != "gs":
+        raise ValueError(f"Unsupported GCS URI: {uri}")
+
+    bucket_name = parsed.netloc
+    blob_name = parsed.path.lstrip("/")
+    if not bucket_name or not blob_name:
+        raise ValueError(f"Invalid GCS URI: {uri}")
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+
+    if log:
+        log.info(
+            "Loading Hugging Face token payload from GCS object gs://%s/%s.",
+            bucket_name,
+            blob_name,
+        )
+
+    token = blob.download_as_text(encoding="utf-8").strip()
+    if not token:
+        raise ValueError(f"Token object gs://{bucket_name}/{blob_name} is empty")
+
+    return token
+
+
 def ensure_hf_token(
     *,
     secret_name: str = "hf-token",
     secret_names: Optional[Iterable[str]] = None,
     env_var: str = "HUGGING_FACE_HUB_TOKEN",
+    explicit_token: Optional[str] = None,
+    token_file: Optional[str] = None,
+    token_gcs_uri: Optional[str] = None,
     log=None,
 ) -> str:
     """Ensure a Hugging Face token is available via env vars.
@@ -66,12 +102,17 @@ def ensure_hf_token(
     The precedence order is:
 
     1. Existing environment variables (``HUGGING_FACE_HUB_TOKEN``/``HF_TOKEN``)
-    2. Google Secret Manager secrets in ``secret_names``/``secret_name`` order
+    2. An explicit token value provided via CLI/config
+    3. Token files (local or GCS)
+    4. Google Secret Manager secrets in ``secret_names``/``secret_name`` order
 
     Args:
         secret_name: Default Secret Manager identifier containing the HF access token.
         secret_names: Optional iterable of secret names to try (in order).
         env_var: Environment variable name to populate with the token.
+        explicit_token: Optional token string supplied via CLI/config.
+        token_file: Optional path to a local file containing the token.
+        token_gcs_uri: Optional ``gs://`` URI pointing to a token file.
         log: Optional logger with an ``info``/``warning`` method.
 
     Returns:
@@ -86,6 +127,48 @@ def ensure_hf_token(
         token = existing.strip()
         if log:
             log.info("Using Hugging Face token from environment variable.")
+        return token
+
+    if explicit_token:
+        token = explicit_token.strip()
+        if not token:
+            raise RuntimeError("Provided Hugging Face token argument was empty after stripping whitespace.")
+        if log:
+            log.info("Using Hugging Face token provided via command line argument.")
+        os.environ[env_var] = token
+        os.environ.setdefault("HF_TOKEN", token)
+        return token
+
+    file_candidate = token_file
+    if file_candidate and file_candidate.startswith("gs://") and not token_gcs_uri:
+        token_gcs_uri = file_candidate
+        file_candidate = None
+
+    if token_gcs_uri:
+        try:
+            token = _load_token_from_gcs(token_gcs_uri, log=log)
+        except Exception as exc:  # pragma: no cover - bubbled up with context
+            raise RuntimeError(
+                f"Failed to read Hugging Face token from GCS URI '{token_gcs_uri}': {exc}"
+            ) from exc
+        os.environ[env_var] = token
+        os.environ.setdefault("HF_TOKEN", token)
+        return token
+
+    if file_candidate:
+        path = Path(file_candidate)
+        if log:
+            log.info("Loading Hugging Face token payload from local file '%s'.", path)
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+        except Exception as exc:  # pragma: no cover - bubbled up with context
+            raise RuntimeError(
+                f"Failed to read Hugging Face token from file '{file_candidate}': {exc}"
+            ) from exc
+        if not token:
+            raise RuntimeError(f"Provided Hugging Face token file '{file_candidate}' was empty.")
+        os.environ[env_var] = token
+        os.environ.setdefault("HF_TOKEN", token)
         return token
 
     client, project_from_creds = _build_secret_client(log=log)
