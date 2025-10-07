@@ -16,6 +16,8 @@ def evaluate(model, val_loader, device: str = "cuda"):
     model.eval()
     meter = Meter()
     total_tokens = 0
+    total_examples = 0
+    total_batches = 0
     for batch in val_loader:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
@@ -26,9 +28,17 @@ def evaluate(model, val_loader, device: str = "cuda"):
         if contrib_tokens == 0:
             contrib_tokens = labels.numel()
         total_tokens += contrib_tokens
+        total_examples += input_ids.size(0)
+        total_batches += 1
         meter.update(loss.item(), k=contrib_tokens)
     if was_training:
         model.train()
     avg_loss = meter.avg if meter.n else 0.0
     ppl = float(torch.exp(torch.tensor(avg_loss))) if total_tokens else float("inf")
-    return {"val_loss": avg_loss, "val_ppl": ppl, "tokens": total_tokens}
+    return {
+        "val_loss": avg_loss,
+        "val_ppl": ppl,
+        "tokens": total_tokens,
+        "examples": total_examples,
+        "batches": total_batches,
+    }

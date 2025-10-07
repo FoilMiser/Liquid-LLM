@@ -32,7 +32,7 @@ def build_dataloaders(
     seed: Optional[int] = None,
     hf_token: Optional[str] = None,
     **_: dict,  # tolerate extra kwargs
-) -> Tuple[DataLoader, DataLoader, int, int, AutoTokenizer]:
+) -> Tuple[DataLoader, DataLoader, int, int, AutoTokenizer, str]:
     # Seeding (no datasets.set_seed)
     if seed is not None:
         random.seed(seed)
@@ -111,4 +111,4 @@ def build_dataloaders(
 
     vocab_size = len(tok)
     pad_id = tok.pad_token_id
-    return train_loader, val_loader, vocab_size, pad_id, tok
+    return train_loader, val_loader, vocab_size, pad_id, tok, val_split

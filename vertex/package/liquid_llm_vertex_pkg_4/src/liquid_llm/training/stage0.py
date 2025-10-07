@@ -83,7 +83,14 @@ def run_training(
         os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", hf_token)
         os.environ.setdefault("HF_TOKEN", hf_token)
 
-    train_dl, val_dl, vocab_size, pad_id, tok = build_dataloaders(
+    (
+        train_dl,
+        val_dl,
+        vocab_size,
+        pad_id,
+        tok,
+        val_split,
+    ) = build_dataloaders(
         teacher_name=teacher_name,
         dataset_name=dataset_name,
         dataset_config=dataset_config,
@@ -166,6 +173,10 @@ def run_training(
         micro_batch=micro_batch,
         global_batch=global_batch,
         hf_token=hf_token,
+        pad_id=pad_id,
+        dataset_name=dataset_name,
+        val_split=val_split,
+        grad_clip_norm=1.0,
         # logger used by train_loop
         log=get_logger("train"),
         # optional bookkeeping for your own use
