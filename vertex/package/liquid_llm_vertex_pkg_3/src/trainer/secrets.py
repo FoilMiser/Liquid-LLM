@@ -53,8 +53,9 @@ def ensure_hf_token(
     token_file: Optional[str] = None,
     token_gcs_uri: Optional[str] = None,
     storage_client: Optional[storage.Client] = None,
+    allow_missing: bool = False,
     log=None,
-) -> str:
+) -> Optional[str]:
     """Ensure a Hugging Face token is available via env vars.
 
     The precedence order is:
@@ -72,7 +73,8 @@ def ensure_hf_token(
         log: Optional logger with an ``info``/``warning`` method.
 
     Returns:
-        The Hugging Face token string.
+        The Hugging Face token string if one could be resolved, otherwise
+        ``None`` when ``allow_missing`` is True.
 
     Raises:
         RuntimeError: If the token cannot be resolved.
@@ -175,6 +177,15 @@ def ensure_hf_token(
             return token
 
     details = ", ".join(f"{name}: {err}" for name, err in errors) or "no candidates"
+    if allow_missing:
+        if log:
+            log.warning(
+                "Failed to resolve a Hugging Face token from any configured "
+                "source; continuing without one. Attempts: %s",
+                details,
+            )
+        return None
+
     raise RuntimeError(
         "Failed to resolve a Hugging Face token from any configured source. "
         f"Attempts: {details}"
