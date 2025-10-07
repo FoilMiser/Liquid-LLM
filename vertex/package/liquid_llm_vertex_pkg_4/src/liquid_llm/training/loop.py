@@ -61,16 +61,28 @@ def _count_tokens(labels, fallback_tokens):
 
 
 def _save_ckpt(ckptio, state, step, filename, log):
-    """Helper to save a checkpoint and log locations."""
+    """Helper to save a checkpoint and log locations.
+
+    Returns
+    -------
+    tuple[str, str | None]
+        A pair of the local path on disk and, when uploading is enabled,
+        the destination URI in GCS.
+    """
     state_dict = {
         "model": state["model"].state_dict(),
         "optimizer": state["optimizer"].state_dict(),
         "scheduler": state["scheduler"].state_dict(),
         "step": step,
     }
-    local, uri = ckptio(state_dict, state["local_outdir"], state["gcs_outdir"], filename=filename)
+    local, uri = ckptio(
+        state_dict,
+        state["local_outdir"],
+        state.get("gcs_outdir"),
+        filename=filename,
+    )
     log.info(f"[ckpt] saved {local}" + (f" and uploaded to {uri}" if uri else ""))
-    return local
+    return local, uri
 
 
 # -----------------------------
@@ -636,13 +648,43 @@ def train_loop(state):
                     best_val_loss = val_loss
 
                     # Rolling "best.pt" (always the current best)
-                    best_path_local = _save_ckpt(
+                    best_path_local, best_uri = _save_ckpt(
                         ckptio, state, step, filename="best.pt", log=log
+                    )
+                    log_state = state.setdefault("log_state", {})
+                    if state.get("gcs_outdir") and not best_uri:
+                        log.warning(
+                            "[ckpt] expected to upload best checkpoint to %s but no URI was returned",
+                            state["gcs_outdir"],
+                        )
+                    log_state["best_checkpoint"] = {
+                        "step": step,
+                        "val_loss": float(val_loss),
+                        "local_path": best_path_local,
+                        "gcs_uri": best_uri,
+                    }
+                    log_state.setdefault("best_history", []).append(
+                        {
+                            "step": step,
+                            "val_loss": float(val_loss),
+                            "local_path": best_path_local,
+                            "gcs_uri": best_uri,
+                        }
                     )
 
                     # Versioned best snapshot for historical/top-K retention
                     vers_name = f"ckpt_best_step{step}_vl{val_loss:.4f}.pt"
-                    _save_ckpt(ckptio, state, step, filename=vers_name, log=log)
+                    vers_local, vers_uri = _save_ckpt(
+                        ckptio, state, step, filename=vers_name, log=log
+                    )
+                    log_state.setdefault("best_versioned", []).append(
+                        {
+                            "step": step,
+                            "val_loss": float(val_loss),
+                            "local_path": vers_local,
+                            "gcs_uri": vers_uri,
+                        }
+                    )
 
                     # Prune older best checkpoints per policy
                     try:
@@ -662,7 +704,16 @@ def train_loop(state):
 
             # Step-based checkpointing
             if save_every > 0 and step % save_every == 0:
-                _save_ckpt(ckptio, state, step, filename=f"ckpt_step_{step}.pt", log=log)
+                step_local, step_uri = _save_ckpt(
+                    ckptio, state, step, filename=f"ckpt_step_{step}.pt", log=log
+                )
+                state.setdefault("log_state", {}).setdefault("step_checkpoints", []).append(
+                    {
+                        "step": step,
+                        "local_path": step_local,
+                        "gcs_uri": step_uri,
+                    }
+                )
                 # Prune older step checkpoints per policy (age &/or count)
                 try:
                     _prune_step_ckpts(
@@ -682,7 +733,16 @@ def train_loop(state):
             if time_ckpt_secs > 0 and (now_ts - last_time_ckpt_ts) >= time_ckpt_secs:
                 ts = int(now_ts)
                 fname = f"ckpt_time_{ts}.pt"
-                _save_ckpt(ckptio, state, step, filename=fname, log=log)
+                time_local, time_uri = _save_ckpt(
+                    ckptio, state, step, filename=fname, log=log
+                )
+                state.setdefault("log_state", {}).setdefault("time_checkpoints", []).append(
+                    {
+                        "step": step,
+                        "local_path": time_local,
+                        "gcs_uri": time_uri,
+                    }
+                )
                 last_time_ckpt_ts = now_ts
                 state["last_time_ckpt_ts"] = last_time_ckpt_ts  # persist within this run
 
