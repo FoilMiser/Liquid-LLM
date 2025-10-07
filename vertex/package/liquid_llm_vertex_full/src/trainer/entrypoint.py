@@ -13,13 +13,24 @@ def main(argv=None):
     init_logger()
     log = get_logger('entrypoint')
 
-    log.info(f"Parsed config: {cfg}")
+    sensitive_keys = {"hf_token_value", "hf_token_file", "hf_token_gcs_uri"}
+    redacted_cfg = {
+        key: ("<redacted>" if key in sensitive_keys and cfg.get(key) else value)
+        for key, value in cfg.items()
+    }
+    log.info("Parsed config: %s", redacted_cfg)
     set_all_seeds(cfg['seed'])
 
     secret_names = None
     if cfg.get('hf_secret_name'):
         secret_names = [cfg['hf_secret_name']]
-    hf_token = ensure_hf_token(secret_names=secret_names, log=log)
+    hf_token = ensure_hf_token(
+        secret_names=secret_names,
+        explicit_token=cfg.pop('hf_token_value', None),
+        token_file=cfg.pop('hf_token_file', None),
+        token_gcs_uri=cfg.pop('hf_token_gcs_uri', None),
+        log=log,
+    )
     cfg['hf_token'] = hf_token
 
     run_training(**cfg)
