@@ -191,5 +191,21 @@ def run_training(
         "step": final_step,
         "tokenizer": getattr(tok, "name_or_path", None),
     }
-    save_and_maybe_upload(sd, local_outdir, gcs_outdir, filename="final.pt")
+    final_local, final_uri = save_and_maybe_upload(
+        sd, local_outdir, gcs_outdir, filename="final.pt"
+    )
+    if gcs_outdir and not final_uri:
+        log.warning(
+            "[ckpt] expected to upload final checkpoint to %s but no URI was returned",
+            gcs_outdir,
+        )
+    state.setdefault("log_state", {}).update(
+        {
+            "final_checkpoint": {
+                "step": final_step,
+                "local_path": final_local,
+                "gcs_uri": final_uri,
+            }
+        }
+    )
     log.info(f"Finished at step {final_step}.")
