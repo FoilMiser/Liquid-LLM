@@ -1,0 +1,8 @@
+--resume_gcs_uri=gs://liquid-llm-bucket/liquid-llm/stage0/checkpoints/step_68150_20250919-034436_best_174.72.pt
+--block_size=512
+--teacher_name=gpt2-xl
+--dataset_name=wikitext
+--dataset_config=wikitext-103-raw-v1
+--output_gcs_uri=gs://liquid-llm-bucket/liquid-llm/stage0/checkpoints/vertex_runs/$(date +%Y%m%d-%H%M%S)
+--train_steps=1000000
+--hf_secret_name=hf_token
