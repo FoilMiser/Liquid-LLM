@@ -166,6 +166,10 @@ def run_training(
         micro_batch=micro_batch,
         global_batch=global_batch,
         hf_token=hf_token,
+        pad_id=pad_id,
+        dataset_name=dataset_name,
+        val_split=val_split,
+        grad_clip_norm=1.0,
         # logger used by train_loop
         log=get_logger("train"),
         # optional bookkeeping for your own use
