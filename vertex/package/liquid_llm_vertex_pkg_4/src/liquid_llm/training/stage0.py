@@ -156,6 +156,7 @@ def run_training(
         eval_every=eval_every,
         log_interval=log_interval,
         train_steps=train_steps,
+        block_size=block_size,
         output_prefix="",
         ckptio=save_and_maybe_upload,
         local_outdir=str(local_outdir),
