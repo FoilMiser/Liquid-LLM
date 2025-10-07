@@ -186,7 +186,7 @@ def train_loop(state):
                 teacher_metrics = evaluate(teacher, val_loader, device=device)
                 teacher.eval()  # ensure eval mode retained after evaluation helper
                 log.info(
-                    "[teacher] val_loss=%.4f ppl=%.2f",
+                    "[teacher] step=0 val_loss=%.4f ppl=%.2f",
                     teacher_metrics["val_loss"],
                     teacher_metrics["val_ppl"],
                 )

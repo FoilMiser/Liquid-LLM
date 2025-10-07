@@ -82,7 +82,13 @@ def build_dataloaders(
 
     def _collate_causal(features: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
         input_ids = torch.tensor([f["input_ids"] for f in features], dtype=torch.long)
-        labels = torch.tensor([f["labels"] for f in features], dtype=torch.long)
+        # Next-token prediction: each position targets the subsequent token.
+        # The final position has no target and is masked with -100 so it does
+        # not contribute to the loss (mirrors HF causal LM convention).
+        labels = input_ids.clone()
+        labels[:, :-1] = input_ids[:, 1:]
+        labels[:, -1] = -100
+
         attention_mask = torch.ones_like(input_ids, dtype=torch.long)
         return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
 
