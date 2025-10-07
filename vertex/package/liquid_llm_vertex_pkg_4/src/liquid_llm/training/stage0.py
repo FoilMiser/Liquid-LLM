@@ -83,7 +83,14 @@ def run_training(
         os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", hf_token)
         os.environ.setdefault("HF_TOKEN", hf_token)
 
-    train_dl, val_dl, vocab_size, pad_id, tok = build_dataloaders(
+    (
+        train_dl,
+        val_dl,
+        vocab_size,
+        pad_id,
+        tok,
+        val_split,
+    ) = build_dataloaders(
         teacher_name=teacher_name,
         dataset_name=dataset_name,
         dataset_config=dataset_config,
