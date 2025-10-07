@@ -132,7 +132,6 @@ def train_loop(state):
     device        = state["device"]
     teacher_name  = state["teacher_name"]
     kd_alpha      = state.get("kd_alpha", 0.5)
-    kd_temperature = state.get("kd_temperature", 1.0)
     train_loader  = state["train_loader"]
     val_loader    = state["val_loader"]
     optimizer     = state["optimizer"]
@@ -143,7 +142,7 @@ def train_loop(state):
     total_steps   = state["train_steps"]
     ckptio        = state["ckptio"]
     precision     = state.get("precision", "fp16")
-    grad_clip     = state.get("grad_clip", 1.0)
+    hf_token      = state.get("hf_token")
 
     # --- Time-based checkpoint cadence & retention ---
     time_ckpt_secs            = int(state.get("time_ckpt_secs", 1800))            # every 30 min by default
@@ -171,10 +170,36 @@ def train_loop(state):
 
     # Optional teacher (for KD)
     teacher = None
+    teacher_metrics = None
     if kd_alpha and kd_alpha > 0:
-        teacher = AutoModelForCausalLM.from_pretrained(teacher_name).to(device).eval()
-        for p in teacher.parameters():
-            p.requires_grad_(False)
+        auth_kwargs = {"token": hf_token} if hf_token else {}
+        log.info(f"Loading teacher model '{teacher_name}' for knowledge distillation.")
+        try:
+            teacher = AutoModelForCausalLM.from_pretrained(teacher_name, **auth_kwargs).to(device).eval()
+            for p in teacher.parameters():
+                p.requires_grad_(False)
+            log.info(f"Teacher model '{teacher_name}' loaded and frozen for KD.")
+
+            try:
+                teacher_metrics = evaluate(teacher, val_loader, device=device)
+                teacher.eval()  # ensure eval mode retained after evaluation helper
+                log.info(
+                    "[teacher] val_loss=%.4f ppl=%.2f",
+                    teacher_metrics["val_loss"],
+                    teacher_metrics["val_ppl"],
+                )
+            except Exception as eval_exc:  # pragma: no cover - defensive logging
+                log.warning(f"Teacher evaluation failed: {eval_exc}")
+                teacher_metrics = None
+
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log.warning(f"Failed to load teacher model '{teacher_name}': {exc}")
+            teacher = None
+            teacher_metrics = None
+
+    if teacher_metrics is not None:
+        state["teacher_metrics"] = teacher_metrics
+        state.setdefault("log_state", {}).setdefault("teacher_eval", teacher_metrics)
 
     step = state.get("step", 0)
     scaler = torch.amp.GradScaler("cuda", enabled=(precision == "fp16"))
@@ -203,7 +228,7 @@ def train_loop(state):
                 if teacher is not None and kd_alpha > 0:
                     with torch.no_grad():
                         logits_t = _get_logits(teacher(input_ids))
-                    T = kd_temperature
+                    T = 1.0
                     logprob_s = torch.nn.functional.log_softmax(logits_s / T, dim=-1)
                     prob_t    = torch.nn.functional.softmax(logits_t / T, dim=-1)
                     loss_kd   = torch.nn.functional.kl_div(
@@ -214,8 +239,7 @@ def train_loop(state):
                     loss = loss_ce
 
             scaler.scale(loss).backward()
-            if grad_clip is not None and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -253,7 +277,16 @@ def train_loop(state):
                 model.eval()
                 metrics = evaluate(model, val_loader, device=device)
                 val_loss = float(metrics["val_loss"])
-                log.info(f"[eval] step={step} val_loss={val_loss:.4f} ppl={metrics['val_ppl']:.2f}")
+                teacher_msg = ""
+                teacher_metrics = state.get("teacher_metrics")
+                if teacher_metrics:
+                    teacher_msg = (
+                        f" teacher_val_loss={teacher_metrics['val_loss']:.4f}"
+                        f" teacher_ppl={teacher_metrics['val_ppl']:.2f}"
+                    )
+                log.info(
+                    f"[eval] step={step} val_loss={val_loss:.4f} ppl={metrics['val_ppl']:.2f}" + teacher_msg
+                )
 
                 # New best? Save/overwrite best.pt and versioned best snapshot
                 if val_loss < best_val_loss:
