@@ -17,6 +17,8 @@ def get_parser():
                    help='Path to a file containing the Hugging Face token')
     p.add_argument('--hf_token_gcs_uri', type=str, default=None,
                    help='GCS URI to a file containing the Hugging Face token')
+    p.add_argument('--require_hf_token', action='store_true',
+                   help='Fail if a Hugging Face token cannot be resolved')
 
     # Outputs
     p.add_argument('--output_gcs_uri', type=str, default=None)
@@ -62,6 +64,10 @@ def parse_args(argv=None):
         v = getattr(args, name, None)
         return default if v is None else v
 
+    require_hf_token = bool(merged.get('require_hf_token', False))
+    if args.require_hf_token:
+        require_hf_token = True
+
     cfg = {
         'resume_gcs_uri': args.resume_gcs_uri,
         'block_size': args.block_size,
@@ -74,6 +80,7 @@ def parse_args(argv=None):
         'hf_token_value': o('hf_token_value', merged.get('hf_token_value')),
         'hf_token_file': o('hf_token_file', merged.get('hf_token_file')),
         'hf_token_gcs_uri': o('hf_token_gcs_uri', merged.get('hf_token_gcs_uri')),
+        'require_hf_token': require_hf_token,
         'seed': o('seed', merged.get('seed', 42)),
         'global_batch': o('global_batch', merged.get('global_batch', 64)),
         'micro_batch': o('micro_batch', merged.get('micro_batch', 8)),
