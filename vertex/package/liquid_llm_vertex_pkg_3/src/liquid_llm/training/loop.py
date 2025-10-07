@@ -171,6 +171,8 @@ def train_loop(state):
     # Optional teacher (for KD)
     teacher = None
     teacher_metrics = None
+    teacher_load_error = None
+    teacher_eval_error = None
     if kd_alpha and kd_alpha > 0:
         auth_kwargs = {"token": hf_token} if hf_token else {}
         log.info(f"Loading teacher model '{teacher_name}' for knowledge distillation.")
@@ -189,13 +191,29 @@ def train_loop(state):
                     teacher_metrics["val_ppl"],
                 )
             except Exception as eval_exc:  # pragma: no cover - defensive logging
-                log.warning(f"Teacher evaluation failed: {eval_exc}")
+                teacher_eval_error = eval_exc
+                log.error(f"Teacher evaluation failed: {eval_exc}")
                 teacher_metrics = None
 
         except Exception as exc:  # pragma: no cover - defensive logging
-            log.warning(f"Failed to load teacher model '{teacher_name}': {exc}")
+            teacher_load_error = exc
+            log.error(f"Failed to load teacher model '{teacher_name}': {exc}")
             teacher = None
             teacher_metrics = None
+
+        if teacher is None:
+            msg = (
+                "Knowledge distillation was requested (kd_alpha>0) but the teacher model "
+                f"'{teacher_name}' could not be loaded. Aborting training."
+            )
+            raise RuntimeError(msg) from teacher_load_error
+
+        if teacher_metrics is None:
+            msg = (
+                "Knowledge distillation was requested (kd_alpha>0) but the teacher model "
+                "failed during evaluation and cannot provide baseline metrics. Aborting training."
+            )
+            raise RuntimeError(msg) from teacher_eval_error
 
     if teacher_metrics is not None:
         state["teacher_metrics"] = teacher_metrics
