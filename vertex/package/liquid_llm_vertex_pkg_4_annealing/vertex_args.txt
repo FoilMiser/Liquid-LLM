@@ -1,0 +1,16 @@
+--resume_gcs_uri=gs://liquid-llm-bucket-2/stage0/checkpoints/vertex_runs/20251007-174419/best.pt
+--block_size=512
+--teacher_name=gpt2-xl
+--dataset_name=wikitext
+--dataset_config=wikitext-103-raw-v1
+--output_gcs_uri=gs://liquid-llm-bucket-2/stage0/checkpoints/vertex_runs/$(date +%Y%m%d-%H%M%S)
+--alpha=0.7
+--T=1.2
+--alpha_schedule=0:0.7,400:0.5,800:0.3
+--temp_schedule=0:1.2,800:1.0
+--eval_ctx_lens=512,1024
+--grad_accum=1
+--warmup_steps=200
+--lr_peak=2.7e-4
+--train_steps=1200
+--hf_secret_name=hf_token
