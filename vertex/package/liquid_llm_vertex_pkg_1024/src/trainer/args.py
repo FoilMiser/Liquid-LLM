@@ -58,6 +58,10 @@ def get_parser():
                    help='Scalar schedule for KD alpha (e.g. cosine:hold_steps=2000,start=0.2,end=0.05,total_steps=25000)')
     p.add_argument('--temp_schedule', type=str, default=None,
                    help='Scalar schedule for KD temperature (e.g. linear:start=1.5,end=1.0,total_steps=10000)')
+    p.add_argument('--kd_scheme', type=str, default=None,
+                   help='Knowledge distillation scheme identifier (e.g. forward_kl)')
+    p.add_argument('--kl_scale', type=str, default=None,
+                   help='Scaling to apply to the KL loss (e.g. T^2, T, 1, or numeric)')
     p.add_argument('--save_best_on', type=str, default='val_loss_student',
                    help='Validation metric key used for best checkpointing (e.g. val_loss_student@1024)')
     p.add_argument('--save_every_steps', type=int, default=5000,
@@ -156,6 +160,8 @@ def parse_args(argv=None):
         'T': o('T', merged.get('T')),
         'alpha_schedule': schedule_spec(o('alpha_schedule', merged.get('alpha_schedule'))),
         'temp_schedule': schedule_spec(o('temp_schedule', merged.get('temp_schedule'))),
+        'kd_scheme': o('kd_scheme', merged.get('kd_scheme')),
+        'kl_scale': o('kl_scale', merged.get('kl_scale')),
         'eval_ctx_lens': parse_eval_ctx_lens(o('eval_ctx_lens', merged.get('eval_ctx_lens'))),
         'reset_optim_on_ctx_change': bool(o('reset_optim_on_ctx_change', merged.get('reset_optim_on_ctx_change', False))),
         'grad_accum': o('grad_accum', merged.get('grad_accum')),

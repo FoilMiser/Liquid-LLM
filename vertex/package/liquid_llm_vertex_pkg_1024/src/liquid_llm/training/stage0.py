@@ -76,6 +76,8 @@ def run_training(
     save_every_steps: int = 5000,
     schedule_from_zero: bool = False,
     reset_lrsched_on_resume: bool = False,
+    kd_scheme: str | None = None,
+    kl_scale: str | None = None,
 ):
     log = get_logger("stage0")
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -222,6 +224,26 @@ def run_training(
     if save_every_steps is None:
         save_every_steps = checkpoint_meta.get("save_every_steps", 5000)
     save_every_steps = int(save_every_steps)
+
+    kd_scheme_requested = (
+        kd_scheme
+        or trainer_resume_state.get("kd_scheme")
+        or checkpoint_meta.get("kd_scheme")
+    )
+    if kd_scheme_requested:
+        kd_scheme_requested = str(kd_scheme_requested)
+    else:
+        kd_scheme_requested = "forward_kl"
+
+    kl_scale_requested = (
+        kl_scale
+        or trainer_resume_state.get("kl_scale")
+        or checkpoint_meta.get("kl_scale")
+    )
+    if kl_scale_requested:
+        kl_scale_requested = str(kl_scale_requested)
+    else:
+        kl_scale_requested = "T^2"
 
     ckpt_block_size = checkpoint_meta.get("block_size")
     if ckpt_block_size and ckpt_block_size != block_size:
@@ -433,6 +455,8 @@ def run_training(
             "pkg_ver": pkg_ver,
             "resume_uri": resume_gcs_uri,
         },
+        kd_scheme=kd_scheme_requested,
+        kl_scale=kl_scale_requested,
         # logger used by train_loop
         log=get_logger("train"),
         # optional bookkeeping for your own use
@@ -451,6 +475,8 @@ def run_training(
             "phase_base": int(state.get("phase_base", 0)),
             "alpha_schedule_spec": state.get("kd_alpha_schedule_spec"),
             "temp_schedule_spec": state.get("kd_temperature_schedule_spec"),
+            "kd_scheme": state.get("kd_scheme"),
+            "kl_scale": state.get("kl_scale"),
         }
         meta = {
             "block_size": state.get("block_size"),
@@ -469,6 +495,8 @@ def run_training(
             "phase_base": trainer_state["phase_base"],
             "save_best_on": state.get("save_best_on"),
             "save_every_steps": state.get("save_every_steps"),
+            "kd_scheme": state.get("kd_scheme"),
+            "kl_scale": state.get("kl_scale"),
         }
         meta = {k: v for k, v in meta.items() if v is not None}
         return {"trainer_state": trainer_state, "meta": meta}

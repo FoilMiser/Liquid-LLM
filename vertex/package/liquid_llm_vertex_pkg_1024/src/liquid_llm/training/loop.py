@@ -78,6 +78,32 @@ def _get_logits(output):
     return output
 
 
+def _evaluate_kl_scale(scale_spec, temperature: float):
+    """Resolve a KL scaling specification against the current temperature."""
+
+    if scale_spec is None:
+        spec = "T^2"
+    else:
+        spec = str(scale_spec).strip()
+        if not spec:
+            spec = "T^2"
+
+    normalized = spec.lower()
+    if normalized in {"t^2", "t2", "temperature^2", "temp^2"}:
+        return temperature * temperature, "T^2", True
+    if normalized in {"t", "temp", "temperature"}:
+        return temperature, "T", True
+    if normalized in {"1", "none", "identity", "no"}:
+        return 1.0, "1", True
+
+    try:
+        value = float(spec)
+    except ValueError:
+        return temperature * temperature, spec, False
+    else:
+        return value, spec, True
+
+
 def _count_tokens(labels, fallback_tokens):
     """
     Prefer counting tokens actually contributing to loss (labels != -100).
@@ -271,6 +297,24 @@ def train_loop(state):
     _refresh_kd_schedules(state, phase_step)
     kd_alpha      = float(state.get("kd_alpha", 0.5))
     kd_temperature = float(state.get("kd_temperature", 1.0))
+    kd_scheme_config = state.get("kd_scheme") or "forward_kl"
+    kd_scheme_config = str(kd_scheme_config)
+    kl_scale_spec = state.get("kl_scale", "T^2")
+    _, kl_scale_display, kl_scale_valid = _evaluate_kl_scale(
+        kl_scale_spec, kd_temperature
+    )
+    if not kl_scale_valid:
+        log.warning(
+            "Unrecognized kl_scale '%s'; defaulting to T^2 (temperature squared).",
+            kl_scale_spec,
+        )
+        kl_scale_spec = "T^2"
+        state["kl_scale"] = kl_scale_spec
+        _, kl_scale_display, _ = _evaluate_kl_scale(
+            kl_scale_spec, kd_temperature
+        )
+    state["kl_scale_resolved"] = kl_scale_display
+    state["kd_scheme"] = kd_scheme_config
     step = global_step
     pad_id        = state.get("pad_id")
     grad_clip_norm = float(state.get("grad_clip_norm", 1.0))
@@ -372,7 +416,7 @@ def train_loop(state):
             raise RuntimeError(msg) from teacher_eval_error
 
     kd_active = teacher is not None and kd_alpha > 0
-    initial_kd_scheme = "forward_kl" if kd_active else "off"
+    initial_kd_scheme = kd_scheme_config if kd_active else "off"
 
     run_fields = {
         "run_id": run_id,
@@ -389,7 +433,7 @@ def train_loop(state):
         "alpha": _format_float(kd_alpha),
         "T": _format_float(kd_temperature),
         "kd_scheme": initial_kd_scheme,
-        "kl_scale": "T^2",
+        "kl_scale": state.get("kl_scale_resolved", kl_scale_display),
     }
     log_stats(log, "run", **run_fields)
 
@@ -406,7 +450,8 @@ def train_loop(state):
         nonlocal kd_params_last
         current_kd_alpha = float(state.get("kd_alpha", kd_alpha))
         current_kd_temperature = float(state.get("kd_temperature", kd_temperature))
-        scheme = "forward_kl" if (teacher is not None and current_kd_alpha > 0) else "off"
+        scheme_value = state.get("kd_scheme", kd_scheme_config) or "forward_kl"
+        scheme = scheme_value if (teacher is not None and current_kd_alpha > 0) else "off"
         current = (current_kd_alpha, current_kd_temperature, scheme)
         if current != kd_params_last:
             log_stats(
@@ -541,6 +586,12 @@ def train_loop(state):
                         overlap = torch.isin(teacher_topk, student_topk)
                         top5_match_value = float(overlap.float().mean().item())
 
+                kl_scale_value, kl_scale_display, _ = _evaluate_kl_scale(
+                    state.get("kl_scale", kl_scale_spec), current_kd_temperature
+                )
+                kl_scale_value = float(kl_scale_value)
+                state["kl_scale_resolved"] = kl_scale_display
+
                 logprob_s_temp = torch.nn.functional.log_softmax(
                     logits_s / current_kd_temperature, dim=-1
                 )
@@ -549,7 +600,7 @@ def train_loop(state):
                 )
                 loss_kd = torch.nn.functional.kl_div(
                     logprob_s_temp, prob_t, reduction="batchmean"
-                ) * (current_kd_temperature * current_kd_temperature)
+                ) * kl_scale_value
 
                 with torch.no_grad():
                     logprob_t_temp = torch.nn.functional.log_softmax(
@@ -562,7 +613,7 @@ def train_loop(state):
                         torch.nn.functional.kl_div(
                             logprob_t_temp, prob_s, reduction="batchmean"
                         )
-                        * (current_kd_temperature * current_kd_temperature)
+                        * kl_scale_value
                     )
                     mse_logits = float(
                         torch.nn.functional.mse_loss(logits_s, logits_t, reduction="mean")
