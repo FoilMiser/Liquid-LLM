@@ -40,6 +40,10 @@ gcloud ai custom-jobs create \
   --worker-pool-spec=machine-type=g2-standard-8,accelerator-type=NVIDIA_L4,accelerator-count=1,container-image-uri=us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest,local-package-path=vertex/package/sanity_check,python-module=sanity_check.cli,executor-image-uri=us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest,args="--checkpoint_gcs_uri=gs://liquid-llm-bucket-2/stage0/checkpoints/vertex_runs/20251009-022648/IMPORTANT/stage0_checkpoints_vertex_runs_20251009-022648_best.pt","--block_size=512","--device=cuda","--dtype=bfloat16","--throughput_tokens=32768","--batch_size=8"
 ```
 
+Existing jobs that still point at `python_module=trainer.entrypoint` do not
+need to be updated.  The package now ships a minimal compatibility module that
+delegates to `sanity_check.cli`, so both launcher styles are supported.
+
 ## Exit Codes
 
 * `0` – all required checks passed
