@@ -17,10 +17,21 @@ def _default_dtype() -> str:
     return "float32"
 
 
+def _default_device() -> str:
+    """Select an appropriate default torch device."""
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stage-0 checkpoint sanity checks")
     parser.add_argument("--checkpoint_gcs_uri", type=str, default=DEFAULT_GCS_URI, help="Checkpoint URI on GCS or local path")
-    parser.add_argument("--device", type=str, default="cuda", help="Torch device to run tests on")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=_default_device(),
+        help="Torch device to run tests on (defaults to CUDA when available, otherwise CPU)",
+    )
     parser.add_argument("--block_size", type=int, default=512, help="Model block size / sequence length")
     parser.add_argument("--tokenizer_name", type=str, default="gpt2", help="Tokenizer name or path")
     parser.add_argument("--throughput_tokens", type=int, default=32768, help="Total tokens to process during throughput probe")
