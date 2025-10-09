@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liquid-llm-vertex-pkg-1024-next"
+version = "0.1.0"
+description = "Liquid LLM Vertex training, evaluation, and pipeline utilities"
+authors = [
+  { name = "Liquid LLM" }
+]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "pyyaml"
+]
+
+[project.scripts]
+llm-train = "liquid_llm.train:main"
+llm-eval = "liquid_llm.eval:main"
+llm-pipeline = "liquid_llm.pipeline_kfp_v2:main"
