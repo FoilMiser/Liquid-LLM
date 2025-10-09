@@ -19,6 +19,7 @@ setup(
         "gcsfs>=2024.6.0",
         "huggingface_hub>=0.24",
         "tqdm>=4.66",
+        "python-json-logger>=2.0.7",
     ],
     include_package_data=True,
     entry_points={

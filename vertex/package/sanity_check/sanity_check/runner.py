@@ -69,6 +69,31 @@ def run(args: argparse.Namespace) -> int:
     def record(result: TestResult) -> None:
         results.append(result)
 
+    def summarize_results(status_override: Optional[str] = None) -> bool:
+        total_duration_ms = (time.perf_counter() - overall_start) * 1000.0
+        tests_passed = sum(1 for r in results if r.is_pass())
+        tests_failed = len(results) - tests_passed
+        required_failed_events = [r.event for r in results if r.required and not r.is_pass()]
+
+        test_statuses = {r.event: r.status for r in results}
+        failed_tests = [r.to_summary() for r in results if not r.is_pass()]
+        extra_metrics = {"test_statuses": test_statuses}
+        if failed_tests:
+            extra_metrics["failed_tests"] = failed_tests
+        if required_failed_events:
+            extra_metrics["required_failed"] = required_failed_events
+
+        status = status_override or ("FAIL" if required_failed_events else "PASS")
+        summarize(
+            ctx,
+            tests_passed=tests_passed,
+            tests_failed=tests_failed,
+            total_duration_ms=total_duration_ms,
+            extra_metrics=extra_metrics,
+            status=status,
+        )
+        return bool(required_failed_events)
+
     def check_runtime() -> bool:
         elapsed = time.perf_counter() - overall_start
         if elapsed > args.max_time_s:
@@ -76,10 +101,7 @@ def run(args: argparse.Namespace) -> int:
             log_json("runtime_limit", "FAIL", ctx, metrics=metrics, duration_ms=0.0)
             timeout_result = TestResult(event="runtime_limit", status="FAIL", metrics=metrics, duration_ms=0.0, required=True, error="Max runtime exceeded")
             record(timeout_result)
-            summarize(ctx, tests_passed=sum(r.status == "PASS" for r in results),
-                      tests_failed=sum(r.status != "PASS" for r in results),
-                      total_duration_ms=(time.perf_counter() - overall_start) * 1000.0,
-                      status="FAIL")
+            summarize_results("FAIL")
             return True
         return False
 
@@ -93,7 +115,7 @@ def run(args: argparse.Namespace) -> int:
         ctx.cuda_driver = str(env_metrics.get("cuda_driver_version"))
 
     if env_result.status != "PASS" and env_result.required:
-        summarize(ctx, tests_passed=0, tests_failed=1, total_duration_ms=(time.perf_counter() - overall_start) * 1000.0, status="FAIL")
+        summarize_results("FAIL")
         return 2
     if check_runtime():
         return 2
@@ -101,10 +123,7 @@ def run(args: argparse.Namespace) -> int:
     download_result, checkpoint_path = _download_checkpoint(ctx, args.checkpoint_gcs_uri)
     record(download_result)
     if download_result.status != "PASS" and download_result.required:
-        summarize(ctx, tests_passed=sum(r.status == "PASS" for r in results),
-                  tests_failed=sum(r.status != "PASS" for r in results),
-                  total_duration_ms=(time.perf_counter() - overall_start) * 1000.0,
-                  status="FAIL")
+        summarize_results("FAIL")
         return 2
     if check_runtime():
         return 2
@@ -126,10 +145,7 @@ def run(args: argparse.Namespace) -> int:
         record(model_result)
 
     if bundle is None or model_result.status != "PASS":
-        summarize(ctx, tests_passed=sum(r.status == "PASS" for r in results),
-                  tests_failed=sum(r.status != "PASS" for r in results),
-                  total_duration_ms=(time.perf_counter() - overall_start) * 1000.0,
-                  status="FAIL")
+        summarize_results("FAIL")
         return 2
     if check_runtime():
         return 2
@@ -144,10 +160,7 @@ def run(args: argparse.Namespace) -> int:
     record(tokenizer_result)
 
     if tokenizer_batch is None:
-        summarize(ctx, tests_passed=sum(r.status == "PASS" for r in results),
-                  tests_failed=sum(r.status != "PASS" for r in results),
-                  total_duration_ms=(time.perf_counter() - overall_start) * 1000.0,
-                  status="FAIL")
+        summarize_results("FAIL")
         return 2
     if check_runtime():
         return 2
@@ -156,10 +169,7 @@ def run(args: argparse.Namespace) -> int:
     forward_result = forward_smoke(ctx, bundle.model, batch, dtype_name=args.dtype)
     record(forward_result)
     if forward_result.status != "PASS" and forward_result.required:
-        summarize(ctx, tests_passed=sum(r.status == "PASS" for r in results),
-                  tests_failed=sum(r.status != "PASS" for r in results),
-                  total_duration_ms=(time.perf_counter() - overall_start) * 1000.0,
-                  status="FAIL")
+        summarize_results("FAIL")
         return 2
     if check_runtime():
         return 2
@@ -167,10 +177,7 @@ def run(args: argparse.Namespace) -> int:
     backward_result = backward_smoke(ctx, bundle.model, batch, dtype_name=args.dtype)
     record(backward_result)
     if backward_result.status != "PASS" and backward_result.required:
-        summarize(ctx, tests_passed=sum(r.status == "PASS" for r in results),
-                  tests_failed=sum(r.status != "PASS" for r in results),
-                  total_duration_ms=(time.perf_counter() - overall_start) * 1000.0,
-                  status="FAIL")
+        summarize_results("FAIL")
         return 2
     if check_runtime():
         return 2
@@ -190,11 +197,5 @@ def run(args: argparse.Namespace) -> int:
     memory_result = memory_stats(ctx)
     record(memory_result)
 
-    total_duration_ms = (time.perf_counter() - overall_start) * 1000.0
-    tests_passed = sum(r.status == "PASS" for r in results)
-    tests_failed = sum(r.status != "PASS" for r in results)
-    required_failed = any(r.required and r.status != "PASS" for r in results)
-
-    status = "FAIL" if required_failed else "PASS"
-    summarize(ctx, tests_passed=tests_passed, tests_failed=tests_failed, total_duration_ms=total_duration_ms, status=status)
+    required_failed = summarize_results()
     return 2 if required_failed else 0
