@@ -42,6 +42,8 @@ def get_parser():
                    help='Optional peak learning rate to reach at the end of warmup')
     p.add_argument('--fp16', action='store_true')
     p.add_argument('--bf16', action='store_true')
+    p.add_argument('--teacher_precision', type=str, default=None,
+                   help='Precision hint for the teacher model (e.g. fp16, bf16, fp32)')
 
     # Model
     p.add_argument('--d_model', type=int, default=None)
@@ -150,6 +152,7 @@ def parse_args(argv=None):
         'log_interval': o('log_interval', merged.get('log_interval', 50)),
         'lr_peak': o('lr_peak', merged.get('lr_peak')),
         'precision': 'bf16' if args.bf16 else ('fp16' if args.fp16 else 'no'),
+        'teacher_precision': o('teacher_precision', merged.get('teacher_precision')),
         'model': {
             'd_model': o('d_model', merged.get('model', {}).get('d_model', 768)),
             'n_layers': o('n_layers', merged.get('model', {}).get('n_layers', 10)),
