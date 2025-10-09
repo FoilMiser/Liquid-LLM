@@ -14,11 +14,15 @@ def _refresh_kd_schedules(state, phase_step: int) -> bool:
     """Update KD alpha/temperature values from their schedule functions."""
 
     changed = False
+    phase_index = int(state.get("phase_index", 0))
     for key, fn_key in (("kd_alpha", "kd_alpha_schedule_fn"), ("kd_temperature", "kd_temperature_schedule_fn")):
         schedule_fn = state.get(fn_key)
         if not callable(schedule_fn):
             continue
-        target_value = float(schedule_fn(max(0, int(phase_step))))
+        if key == "kd_temperature" and state.get("kd_temperature_phase_based", False):
+            target_value = float(schedule_fn(phase_index))
+        else:
+            target_value = float(schedule_fn(max(0, int(phase_step))))
         current_value = state.get(key)
         if current_value is None or not math.isclose(float(current_value), target_value, rel_tol=1e-9, abs_tol=1e-12):
             state[key] = target_value
@@ -131,6 +135,21 @@ def _save_ckpt(ckptio, state, step, filename, log):
         "optimizer": state["optimizer"].state_dict(),
         "scheduler": state["scheduler"].state_dict(),
         "step": step,
+    }
+    run_meta = state.get("run_meta")
+    if run_meta:
+        state_dict["run_meta"] = run_meta
+    resume_meta = state.get("resume_meta")
+    if resume_meta:
+        state_dict["resume_meta"] = resume_meta
+    state_dict["checkpoint_state"] = {
+        "save_best_on": state.get("save_best_on"),
+        "best_metric_key": state.get("best_metric_key"),
+        "best_metric_value": state.get("best_metric_value"),
+        "fallback_save_every": state.get("fallback_save_every"),
+        "eval_every": state.get("eval_every"),
+        "phase_index": state.get("phase_index"),
+        "phase_base": state.get("phase_base"),
     }
     meta = None
     extra_builder = state.get("checkpoint_extra_builder")
@@ -280,6 +299,7 @@ def train_loop(state):
     optimizer     = state["optimizer"]
     scheduler     = state["scheduler"]
     save_every_steps = int(state.get("save_every_steps", 0))
+    fallback_save_every = int(state.get("fallback_save_every", 0))
     eval_every    = state["eval_every"]
     log           = state["log"]
     total_steps   = state["train_steps"]
@@ -291,9 +311,11 @@ def train_loop(state):
     phase_base     = int(state.get("phase_base", 0))
     global_step    = int(state.get("global_step", state.get("step", 0)))
     phase_step     = max(0, global_step - phase_base)
+    phase_index    = int(state.get("phase_index", 0))
     state["global_step"] = global_step
     state["step"] = global_step
     state["phase_step"] = phase_step
+    state["phase_index"] = phase_index
 
     teacher_autocast_dtype = state.get("teacher_autocast_dtype")
     if not isinstance(teacher_autocast_dtype, torch.dtype):
@@ -374,7 +396,7 @@ def train_loop(state):
         step_ckpt_retention_secs = int(step_ckpt_retention_secs)
 
     # Track best validation metric for "best.pt"
-    best_metric_key = str(state.get("save_best_on", "val_loss_student"))
+    best_metric_key = str(state.get("save_best_on", "val_ppl_student"))
     best_metric_value = float(state.get("best_metric_value", float("inf")))
     best_path_local = None
 
@@ -409,6 +431,8 @@ def train_loop(state):
                 )
                 teacher_eval_time = time.time() - teacher_eval_t0
                 teacher.eval()  # ensure eval mode retained after evaluation helper
+                teacher_ce = float(teacher_metrics.get("val_ce", teacher_metrics.get("val_loss", float("nan"))))
+                teacher_ppl = float(teacher_metrics.get("val_ppl", float("nan")))
                 log_stats(
                     log,
                     "eval",
@@ -416,10 +440,10 @@ def train_loop(state):
                     dataset=dataset_name,
                     split=val_split_name,
                     tokens=teacher_metrics.get("tokens", "n/a"),
-                    val_loss_student="na",
-                    ppl_student="na",
-                    val_loss_teacher=_format_float(teacher_metrics["val_loss"]),
-                    ppl_teacher=_format_float(teacher_metrics["val_ppl"]),
+                    val_ce_student="na",
+                    val_ppl_student="na",
+                    val_loss_teacher=_format_float(teacher_ce) if math.isfinite(teacher_ce) else "na",
+                    ppl_teacher=_format_float(teacher_ppl) if math.isfinite(teacher_ppl) else "na",
                     t_eval=_format_float(teacher_eval_time),
                 )
             except Exception as eval_exc:  # pragma: no cover - defensive logging
@@ -450,6 +474,15 @@ def train_loop(state):
     kd_active = teacher is not None and kd_alpha > 0
     initial_kd_scheme = kd_scheme_config if kd_active else "off"
 
+    scheduler_name = type(scheduler).__name__ if scheduler is not None else "none"
+    lr_peak_value = state.get("lr_peak")
+    base_lr = state.get("lr")
+    if base_lr is None:
+        if optimizer is not None and optimizer.param_groups:
+            base_lr = optimizer.param_groups[0].get("lr", 0.0)
+        else:
+            base_lr = 0.0
+
     run_fields = {
         "run_id": run_id,
         "git_sha": run_meta.get("git_sha", "unknown"),
@@ -467,6 +500,14 @@ def train_loop(state):
         "T": _format_float(kd_temperature),
         "kd_scheme": initial_kd_scheme,
         "kl_scale": state.get("kl_scale_resolved", kl_scale_display),
+        "warmup_steps": int(state.get("warmup_steps", 0)),
+        "lr_base": _format_float(base_lr),
+        "lr_peak": _format_float(lr_peak_value) if lr_peak_value is not None else _format_float(base_lr),
+        "lr_scheduler": scheduler_name,
+        "phase_index": phase_index,
+        "phase_base": phase_base,
+        "fallback_save_every": fallback_save_every if fallback_save_every > 0 else "na",
+        "save_best_on": state.get("save_best_on"),
     }
     log_stats(log, "run", **run_fields)
 
@@ -800,6 +841,7 @@ def train_loop(state):
             top1_value = last_top1_match
             top5_value = last_top5_match
             eff_kd = current_kd_alpha * (current_kd_temperature * current_kd_temperature)
+            ppl_train = math.exp(ce_tok_avg) if ce_tok_meter.n else None
 
             train_stats = {
                 "step": step,
@@ -809,6 +851,7 @@ def train_loop(state):
                 "grad_norm": grad_display,
                 "clipped": clipped_display,
                 "ce_tok": _format_float(ce_tok_avg),
+                "ppl_train": _format_float(ppl_train) if ppl_train is not None and math.isfinite(ppl_train) else "na",
                 "kd_tok": _format_float(kd_tok_avg) if kd_tok_meter.n else "na",
                 "total_tok": _format_float(total_tok_avg),
                 "alpha": _format_float(current_kd_alpha),
@@ -872,34 +915,47 @@ def train_loop(state):
                 autocast_dtype=eval_autocast_dtype if device_type == "cuda" else None,
             )
             eval_time = time.time() - eval_t0
-            val_loss = float(metrics["val_loss"])
+            val_ce = float(metrics["val_ce"])
+            val_ppl = float(metrics["val_ppl"])
             teacher_metrics = state.get("teacher_metrics")
+            teacher_ce = None
+            teacher_ppl = None
+            if teacher_metrics:
+                teacher_ce = float(teacher_metrics.get("val_ce", teacher_metrics.get("val_loss", float("nan"))))
+                teacher_ppl = float(teacher_metrics.get("val_ppl", float("nan")))
             eval_stats = {
                 "step": step,
                 "phase_step": phase_step,
                 "dataset": dataset_name,
                 "split": val_split_name,
                 "tokens": metrics.get("tokens", "n/a"),
-                "val_loss_student": _format_float(val_loss),
-                "ppl_student": _format_float(metrics["val_ppl"]),
-                "val_loss_teacher": _format_float(teacher_metrics["val_loss"]) if teacher_metrics else "na",
-                "ppl_teacher": _format_float(teacher_metrics["val_ppl"]) if teacher_metrics else "na",
+                "val_ce_student": _format_float(val_ce),
+                "val_ppl_student": _format_float(val_ppl),
+                "ppl_student": _format_float(val_ppl),
+                "val_loss_student": _format_float(val_ce),
+                "val_loss_teacher": _format_float(teacher_ce) if teacher_ce is not None and math.isfinite(teacher_ce) else "na",
+                "ppl_teacher": _format_float(teacher_ppl) if teacher_ppl is not None and math.isfinite(teacher_ppl) else "na",
                 "t_eval": _format_float(eval_time),
             }
             log_stats(log, "eval", **eval_stats)
 
             all_metrics = {
-                "val_loss_student": val_loss,
-                "ppl_student": float(metrics["val_ppl"]),
+                "val_ce_student": val_ce,
+                "val_ppl_student": val_ppl,
+                "ppl_student": val_ppl,
+                "val_loss_student": val_ce,
             }
             if block_size:
-                all_metrics[f"val_loss_student@{block_size}"] = val_loss
-                all_metrics[f"ppl_student@{block_size}"] = float(metrics["val_ppl"])
+                all_metrics[f"val_ce_student@{block_size}"] = val_ce
+                all_metrics[f"val_ppl_student@{block_size}"] = val_ppl
+                all_metrics[f"ppl_student@{block_size}"] = val_ppl
+                all_metrics[f"val_loss_student@{block_size}"] = val_ce
 
             if eval_ctx_loaders:
                 for ctx_len, loader in eval_ctx_loaders.items():
                     if ctx_len == block_size and loader is val_loader:
                         ctx_metrics = metrics
+                        ctx_eval_time = eval_time
                     else:
                         ctx_eval_t0 = time.time()
                         ctx_metrics = evaluate(
@@ -909,44 +965,59 @@ def train_loop(state):
                             autocast_dtype=eval_autocast_dtype if device_type == "cuda" else None,
                         )
                         ctx_eval_time = time.time() - ctx_eval_t0
+                    ctx_ce = float(ctx_metrics["val_ce"])
+                    ctx_ppl = float(ctx_metrics["val_ppl"])
                     ctx_stats = {
                         "step": step,
                         "phase_step": phase_step,
-                        f"val_loss_student@{ctx_len}": _format_float(float(ctx_metrics["val_loss"])),
-                        f"ppl_student@{ctx_len}": _format_float(float(ctx_metrics["val_ppl"])),
+                        f"val_ce_student@{ctx_len}": _format_float(ctx_ce),
+                        f"val_ppl_student@{ctx_len}": _format_float(ctx_ppl),
+                        f"ppl_student@{ctx_len}": _format_float(ctx_ppl),
+                        f"val_loss_student@{ctx_len}": _format_float(ctx_ce),
                         f"tokens@{ctx_len}": ctx_metrics.get("tokens", "n/a"),
+                        "t_eval": _format_float(ctx_eval_time),
                     }
-                    if ctx_len == block_size:
-                        ctx_stats["t_eval"] = _format_float(eval_time)
-                    else:
-                        ctx_stats["t_eval"] = _format_float(ctx_eval_time)
                     log_stats(log, "eval", prefix=f"ctx={ctx_len}", **ctx_stats)
-                    all_metrics[f"val_loss_student@{ctx_len}"] = float(ctx_metrics["val_loss"])
-                    all_metrics[f"ppl_student@{ctx_len}"] = float(ctx_metrics["val_ppl"])
+                    all_metrics[f"val_ce_student@{ctx_len}"] = ctx_ce
+                    all_metrics[f"val_ppl_student@{ctx_len}"] = ctx_ppl
+                    all_metrics[f"ppl_student@{ctx_len}"] = ctx_ppl
+                    all_metrics[f"val_loss_student@{ctx_len}"] = ctx_ce
+
+            log_state = state.setdefault("log_state", {})
+            eval_record = {"step": step, "phase_step": phase_step}
+            for key, value in all_metrics.items():
+                try:
+                    eval_record[key] = float(value)
+                except (TypeError, ValueError):
+                    eval_record[key] = value
+            log_state.setdefault("history", []).append(eval_record)
+            log_state["last_eval"] = eval_record
 
             monitor_key = best_metric_key
             monitor_value = all_metrics.get(monitor_key)
-            if monitor_value is None:
-                if monitor_key != "val_loss_student":
+            if monitor_value is None or not math.isfinite(float(monitor_value)):
+                if monitor_key != "val_ppl_student":
                     log.warning(
-                        "[eval] Requested save_best_on metric '%s' missing; defaulting to val_loss_student",
+                        "[eval] Requested save_best_on metric '%s' missing or invalid; defaulting to val_ppl_student",
                         monitor_key,
                     )
-                monitor_key = "val_loss_student"
-                monitor_value = val_loss
+                monitor_key = "val_ppl_student"
+                monitor_value = all_metrics.get(monitor_key, val_ppl)
                 best_metric_key = monitor_key
                 state["save_best_on"] = monitor_key
 
-            # New best? Save/overwrite best.pt and versioned best snapshot
-            if monitor_value < best_metric_value:
+            if not math.isfinite(float(monitor_value)):
+                log.warning(
+                    "[eval] Monitor metric '%s' produced a non-finite value; skipping best checkpoint update",
+                    monitor_key,
+                )
+            elif monitor_value < best_metric_value:
                 best_metric_value = monitor_value
 
-                # Rolling "best.pt" (always the current best)
                 best_path_local, best_uri, best_time, best_size = _save_ckpt(
                     ckptio, state, step, filename="best.pt", log=log
                 )
                 ckpt_time_accum += best_time
-                log_state = state.setdefault("log_state", {})
                 if state.get("gcs_outdir") and not best_uri:
                     log.warning(
                         "[ckpt] expected to upload best checkpoint to %s but no URI was returned",
@@ -956,7 +1027,8 @@ def train_loop(state):
                     "step": step,
                     "metric": monitor_key,
                     "metric_value": float(monitor_value),
-                    "val_loss": float(val_loss),
+                    "val_ce": float(val_ce),
+                    "val_ppl": float(val_ppl),
                     "local_path": best_path_local,
                     "gcs_uri": best_uri,
                 }
@@ -965,7 +1037,8 @@ def train_loop(state):
                         "step": step,
                         "metric": monitor_key,
                         "metric_value": float(monitor_value),
-                        "val_loss": float(val_loss),
+                        "val_ce": float(val_ce),
+                        "val_ppl": float(val_ppl),
                         "local_path": best_path_local,
                         "gcs_uri": best_uri,
                     }
@@ -979,13 +1052,13 @@ def train_loop(state):
                     phase_step=phase_step,
                     metric=monitor_key,
                     metric_value=_format_float(monitor_value),
-                    val_loss_student=_format_float(val_loss),
+                    val_ce_student=_format_float(val_ce),
+                    val_ppl_student=_format_float(val_ppl),
                     filename="best.pt",
                     pruned_count=0,
                 )
 
-                # Versioned best snapshot for historical/top-K retention
-                vers_name = f"ckpt_best_step{step}_vl{val_loss:.4f}.pt"
+                vers_name = f"ckpt_best_step{step}_vc{val_ce:.4f}.pt"
                 vers_local, vers_uri, vers_time, vers_size = _save_ckpt(
                     ckptio, state, step, filename=vers_name, log=log
                 )
@@ -995,7 +1068,8 @@ def train_loop(state):
                         "step": step,
                         "metric": monitor_key,
                         "metric_value": float(monitor_value),
-                        "val_loss": float(val_loss),
+                        "val_ce": float(val_ce),
+                        "val_ppl": float(val_ppl),
                         "local_path": vers_local,
                         "gcs_uri": vers_uri,
                     }
@@ -1009,12 +1083,12 @@ def train_loop(state):
                     phase_step=phase_step,
                     metric=monitor_key,
                     metric_value=_format_float(monitor_value),
-                    val_loss_student=_format_float(val_loss),
+                    val_ce_student=_format_float(val_ce),
+                    val_ppl_student=_format_float(val_ppl),
                     filename=vers_name,
                     pruned_count=0,
                 )
 
-                # Prune older best checkpoints per policy
                 prune_t0 = time.time()
                 pruned_best_count = 0
                 try:
@@ -1037,10 +1111,65 @@ def train_loop(state):
                         status="best_prune",
                         step=step,
                         phase_step=phase_step,
-                        val_loss_student=_format_float(val_loss),
+                        val_ce_student=_format_float(val_ce),
                         filename=vers_name,
                         pruned_count=pruned_best_count,
                     )
+
+            latest_local, latest_uri, latest_time, latest_size = _save_ckpt(
+                ckptio, state, step, filename="latest.pt", log=log
+            )
+            ckpt_time_accum += latest_time
+            try:
+                monitor_numeric = float(monitor_value)
+            except (TypeError, ValueError):
+                monitor_numeric = float("nan")
+            latest_entry = {
+                "step": step,
+                "metric": monitor_key,
+                "metric_value": monitor_numeric if math.isfinite(monitor_numeric) else None,
+                "val_ce": float(val_ce),
+                "val_ppl": float(val_ppl),
+                "local_path": latest_local,
+                "gcs_uri": latest_uri,
+            }
+            log_state["latest_checkpoint"] = latest_entry
+            log_stats(
+                log,
+                "ckpt",
+                status="latest",
+                step=step,
+                phase_step=phase_step,
+                val_ce_student=_format_float(val_ce),
+                val_ppl_student=_format_float(val_ppl),
+                filename="latest.pt",
+                pruned_count=0,
+            )
+
+            if fallback_save_every > 0 and step % fallback_save_every == 0:
+                fallback_name = f"ckpt_fallback_{step}.pt"
+                fallback_local, fallback_uri, fallback_time, fallback_size = _save_ckpt(
+                    ckptio, state, step, filename=fallback_name, log=log
+                )
+                ckpt_time_accum += fallback_time
+                log_state.setdefault("fallback_checkpoints", []).append(
+                    {
+                        "step": step,
+                        "local_path": fallback_local,
+                        "gcs_uri": fallback_uri,
+                    }
+                )
+                log_stats(
+                    log,
+                    "ckpt",
+                    status="fallback",
+                    step=step,
+                    phase_step=phase_step,
+                    val_ce_student=_format_float(val_ce),
+                    val_ppl_student=_format_float(val_ppl),
+                    filename=fallback_name,
+                    pruned_count=0,
+                )
 
             model.train()
 
@@ -1064,7 +1193,7 @@ def train_loop(state):
                     status="step",
                     step=step,
                     phase_step=phase_step,
-                    val_loss_student="na",
+                    val_ce_student="na",
                     filename=step_filename,
                     pruned_count=0,
                 )
@@ -1087,7 +1216,7 @@ def train_loop(state):
                             status="step_prune",
                             step=step,
                             phase_step=phase_step,
-                            val_loss_student="na",
+                            val_ce_student="na",
                             filename=step_filename,
                             pruned_count=pruned_step_count,
                         )
@@ -1119,7 +1248,7 @@ def train_loop(state):
                     status="time",
                     step=step,
                     phase_step=phase_step,
-                    val_loss_student="na",
+                    val_ce_student="na",
                     filename=fname,
                     pruned_count=0,
                 )
@@ -1145,7 +1274,7 @@ def train_loop(state):
                             status="time_prune",
                             step=step,
                             phase_step=phase_step,
-                            val_loss_student="na",
+                            val_ce_student="na",
                             filename=fname,
                             pruned_count=pruned_time_count,
                         )
@@ -1160,6 +1289,8 @@ def train_loop(state):
     state["best_metric_value"] = best_metric_value
     state["best_metric_key"] = best_metric_key
     state["best_val_loss"] = best_metric_value
+    if best_metric_key == "val_ppl_student":
+        state["best_val_ppl"] = best_metric_value
     state["tokens_seen_total"] = tokens_seen_total
     state["examples_seen_total"] = examples_seen_total
     state["ema_ce_tok"] = ema_ce_tok

@@ -93,7 +93,7 @@ def run_training(
     grad_accum: int | None = None,
     lr_peak: float | None = None,
     rope_scale: float | None = None,
-    save_best_on: str = "val_loss_student",
+    save_best_on: str = "val_ppl_student",
     save_every_steps: int = 5000,
     schedule_from_zero: bool = False,
     reset_lrsched_on_resume: bool = False,
@@ -240,12 +240,22 @@ def run_training(
         rope_scale = checkpoint_meta.get("rope_scale")
 
     if not save_best_on:
-        save_best_on = checkpoint_meta.get("save_best_on", "val_loss_student")
+        save_best_on = checkpoint_meta.get("save_best_on", "val_ppl_student")
     save_best_on = str(save_best_on)
 
     if save_every_steps is None:
         save_every_steps = checkpoint_meta.get("save_every_steps", 5000)
     save_every_steps = int(save_every_steps)
+
+    if save_every is None:
+        fallback_save_every = trainer_resume_state.get("fallback_save_every")
+        if fallback_save_every is None:
+            fallback_save_every = checkpoint_meta.get("fallback_save_every")
+        if fallback_save_every is None:
+            fallback_save_every = eval_every
+    else:
+        fallback_save_every = save_every
+    fallback_save_every = int(fallback_save_every)
 
     kd_scheme_requested = (
         kd_scheme
@@ -320,6 +330,17 @@ def run_training(
 
     phase_step0 = max(0, resume_step - phase_base)
 
+    resume_phase_index = trainer_resume_state.get("phase_index")
+    if resume_phase_index is None:
+        resume_phase_index = checkpoint_meta.get("phase_index")
+    if resume_phase_index is None:
+        resume_phase_index = 0
+    phase_index = int(resume_phase_index)
+    if schedule_from_zero and resume_step > 0:
+        phase_index = max(0, phase_index + 1)
+    else:
+        phase_index = max(0, phase_index)
+
     kd_alpha_base = alpha if alpha is not None else kd_alpha_default
     kd_alpha_base = 0.5 if kd_alpha_base is None else float(kd_alpha_base)
     kd_temperature_base = T if T is not None else kd_temperature_default
@@ -329,7 +350,7 @@ def run_training(
     temp_schedule_fn = build_scalar_schedule(temp_schedule_spec, kd_temperature_base)
 
     kd_alpha_value = float(alpha_schedule_fn(phase_step0))
-    kd_temperature_value = float(temp_schedule_fn(phase_step0))
+    kd_temperature_value = float(temp_schedule_fn(phase_index))
 
     if resume_step > 0 and reset_lrsched_on_resume:
         peak_scale = 1.0
@@ -377,13 +398,14 @@ def run_training(
     }
 
     log.info(
-        "[anneal] kd_alpha=%s kd_temperature=%s grad_accum=%s rope_scale=%s phase_base=%s phase_step0=%s",
+        "[anneal] kd_alpha=%s kd_temperature=%s grad_accum=%s rope_scale=%s phase_base=%s phase_step0=%s phase_index=%s",
         kd_alpha_value,
         kd_temperature_value,
         grad_accum_value,
         rope_scale if rope_scale is not None else "na",
         phase_base,
         phase_step0,
+        phase_index,
     )
 
     # ---------------------------------------------------------------------
@@ -469,6 +491,7 @@ def run_training(
         global_step=resume_step,
         phase_base=int(phase_base),
         phase_step=int(phase_step0),
+        phase_index=int(phase_index),
         micro_batch=micro_batch,
         global_batch=global_batch,
         hf_token=hf_token,
@@ -484,12 +507,14 @@ def run_training(
         kd_temperature_schedule_fn=temp_schedule_fn,
         kd_alpha_schedule_spec=alpha_schedule_spec,
         kd_temperature_schedule_spec=temp_schedule_spec,
+        kd_temperature_phase_based=True,
         eval_ctx_loaders=eval_ctx_loaders,
         eval_ctx_lens=eval_ctx_lens,
         grad_accum=grad_accum_value,
         lr=lr,
         lr_peak=lr_peak_value,
         warmup_steps=warmup_steps,
+        fallback_save_every=max(0, int(fallback_save_every)),
         pos_embedding_meta=pos_embedding_meta,
         resume_meta=checkpoint_meta,
         kd_resume_state=trainer_resume_state,
@@ -501,6 +526,7 @@ def run_training(
             "git_sha": git_sha,
             "pkg_ver": pkg_ver,
             "resume_uri": resume_gcs_uri,
+            "fallback_save_every": fallback_save_every,
         },
         kd_scheme=kd_scheme_requested,
         kl_scale=kl_scale_requested,
@@ -520,11 +546,17 @@ def run_training(
             "kd_temperature": float(state.get("kd_temperature", 1.0)),
             "grad_accum": int(state.get("grad_accum", 1)),
             "phase_base": int(state.get("phase_base", 0)),
+            "phase_index": int(state.get("phase_index", 0)),
             "alpha_schedule_spec": state.get("kd_alpha_schedule_spec"),
             "temp_schedule_spec": state.get("kd_temperature_schedule_spec"),
             "kd_scheme": state.get("kd_scheme"),
             "kl_scale": state.get("kl_scale"),
             "teacher_precision": state.get("teacher_precision"),
+            "kd_temperature_phase_based": state.get("kd_temperature_phase_based"),
+            "fallback_save_every": state.get("fallback_save_every"),
+            "save_best_on": state.get("save_best_on"),
+            "best_metric_key": state.get("best_metric_key"),
+            "best_metric_value": state.get("best_metric_value"),
         }
         meta = {
             "block_size": state.get("block_size"),
@@ -541,11 +573,16 @@ def run_training(
             "eval_ctx_lens": state.get("eval_ctx_lens"),
             "rope_scale": state.get("rope_scale"),
             "phase_base": trainer_state["phase_base"],
+            "phase_index": trainer_state["phase_index"],
             "save_best_on": state.get("save_best_on"),
             "save_every_steps": state.get("save_every_steps"),
+            "fallback_save_every": state.get("fallback_save_every"),
             "kd_scheme": state.get("kd_scheme"),
             "kl_scale": state.get("kl_scale"),
             "teacher_precision": state.get("teacher_precision"),
+            "kd_temperature_phase_based": state.get("kd_temperature_phase_based"),
+            "best_metric_key": state.get("best_metric_key"),
+            "best_metric_value": state.get("best_metric_value"),
         }
         meta = {k: v for k, v in meta.items() if v is not None}
         return {"trainer_state": trainer_state, "meta": meta}

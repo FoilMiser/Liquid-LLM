@@ -169,7 +169,7 @@ def parse_args(argv=None):
         'reset_optim_on_ctx_change': bool(o('reset_optim_on_ctx_change', merged.get('reset_optim_on_ctx_change', False))),
         'grad_accum': o('grad_accum', merged.get('grad_accum')),
         'rope_scale': o('rope_scale', merged.get('rope_scale')),
-        'save_best_on': o('save_best_on', merged.get('save_best_on', 'val_loss_student')),
+        'save_best_on': o('save_best_on', merged.get('save_best_on', 'val_ppl_student')),
         'save_every_steps': o('save_every_steps', merged.get('save_every_steps', 5000)),
         'schedule_from_zero': bool(o('schedule_from_zero', merged.get('schedule_from_zero', False))),
         'reset_lrsched_on_resume': bool(o('reset_lrsched_on_resume', merged.get('reset_lrsched_on_resume', False))),

@@ -51,8 +51,9 @@ def evaluate(model, val_loader, device: str = "cuda", autocast_dtype=None):
     avg_loss = meter.avg if meter.n else 0.0
     ppl = float(torch.exp(torch.tensor(avg_loss))) if total_tokens else float("inf")
     return {
-        "val_loss": avg_loss,
+        "val_ce": avg_loss,
         "val_ppl": ppl,
+        "val_loss": avg_loss,
         "tokens": total_tokens,
         "examples": total_examples,
         "batches": total_batches,
