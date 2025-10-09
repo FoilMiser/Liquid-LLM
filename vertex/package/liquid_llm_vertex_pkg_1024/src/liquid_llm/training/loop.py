@@ -1,6 +1,7 @@
 import time
 import math
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
 import torch
@@ -294,6 +295,23 @@ def train_loop(state):
     state["step"] = global_step
     state["phase_step"] = phase_step
 
+    teacher_autocast_dtype = state.get("teacher_autocast_dtype")
+    if not isinstance(teacher_autocast_dtype, torch.dtype):
+        teacher_autocast_dtype = None
+    eval_autocast_dtype = state.get("eval_autocast_dtype")
+    if not isinstance(eval_autocast_dtype, torch.dtype):
+        eval_autocast_dtype = None
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+
+    def _autocast_for(dtype):
+        if dtype is None:
+            return nullcontext()
+        if device_type == "cuda":
+            return torch.autocast(device_type=device_type, dtype=dtype)
+        if device_type == "cpu" and dtype == torch.bfloat16:
+            return torch.autocast(device_type=device_type, dtype=dtype)
+        return nullcontext()
+
     _refresh_kd_schedules(state, phase_step)
     kd_alpha      = float(state.get("kd_alpha", 0.5))
     kd_temperature = float(state.get("kd_temperature", 1.0))
@@ -368,13 +386,27 @@ def train_loop(state):
     if kd_alpha and kd_alpha > 0:
         auth_kwargs = {"token": hf_token} if hf_token else {}
         try:
-            teacher = AutoModelForCausalLM.from_pretrained(teacher_name, **auth_kwargs).to(device).eval()
+            load_kwargs = dict(**auth_kwargs)
+            if teacher_autocast_dtype is not None and device_type == "cuda":
+                load_kwargs["torch_dtype"] = teacher_autocast_dtype
+                load_kwargs.setdefault("low_cpu_mem_usage", True)
+            teacher = AutoModelForCausalLM.from_pretrained(teacher_name, **load_kwargs)
+            if teacher_autocast_dtype is not None:
+                teacher = teacher.to(device=device, dtype=teacher_autocast_dtype)
+            else:
+                teacher = teacher.to(device)
+            teacher.eval()
             for p in teacher.parameters():
                 p.requires_grad_(False)
 
             try:
                 teacher_eval_t0 = time.time()
-                teacher_metrics = evaluate(teacher, val_loader, device=device)
+                teacher_metrics = evaluate(
+                    teacher,
+                    val_loader,
+                    device=device,
+                    autocast_dtype=teacher_autocast_dtype if device_type == "cuda" else None,
+                )
                 teacher_eval_time = time.time() - teacher_eval_t0
                 teacher.eval()  # ensure eval mode retained after evaluation helper
                 log_stats(
@@ -426,6 +458,7 @@ def train_loop(state):
         "device": device,
         "world_size": world_size,
         "precision": precision,
+        "teacher_precision": state.get("teacher_precision", "fp16"),
         "dataset": dataset_name,
         "seq_len": seq_len,
         "batch": global_batch,
@@ -551,97 +584,103 @@ def train_loop(state):
 
         with torch.amp.autocast("cuda", enabled=(precision == "fp16")):
             logits_s = _get_logits(model(input_ids))
-            loss_ce = cross_entropy(logits_s, labels)
 
-            logits_s_detached = logits_s.detach()
+        logits_s_fp32 = logits_s.float()
+        loss_ce = cross_entropy(logits_s_fp32, labels)
 
-            loss_kd = None
-            reverse_kd = 0.0
-            mse_logits = 0.0
-            top1_match_value = None
-            top5_match_value = None
-            logprob_corr_value = None
-            teacher_entropy_sum = 0.0
+        logits_s_detached = logits_s_fp32.detach()
 
-            if kd_active_step:
-                with torch.no_grad():
+        loss_kd = None
+        reverse_kd = 0.0
+        mse_logits = 0.0
+        top1_match_value = None
+        top5_match_value = None
+        logprob_corr_value = None
+        teacher_entropy_sum = 0.0
+
+        if kd_active_step:
+            with torch.no_grad():
+                with _autocast_for(teacher_autocast_dtype):
                     logits_t = _get_logits(teacher(input_ids))
+            logits_t = logits_t.float()
+            logits_s_detached = logits_s_detached.float()
+            logits_s_fp32 = logits_s_fp32.float()
 
-                if logits_t.shape != logits_s.shape:
-                    raise RuntimeError(
-                        "Teacher and student logits shapes do not match: "
-                        f"teacher={tuple(logits_t.shape)} student={tuple(logits_s.shape)}"
-                    )
-
-                with torch.no_grad():
-                    match_tensor = (
-                        logits_s_detached.argmax(dim=-1) == logits_t.argmax(dim=-1)
-                    ).float().mean()
-                    top1_match_value = float(match_tensor.item())
-
-                    k_top = min(5, logits_t.size(-1))
-                    if k_top > 0:
-                        student_topk = torch.topk(logits_s_detached, k=k_top, dim=-1).indices
-                        teacher_topk = torch.topk(logits_t, k=k_top, dim=-1).indices
-                        overlap = torch.isin(teacher_topk, student_topk)
-                        top5_match_value = float(overlap.float().mean().item())
-
-                kl_scale_value, kl_scale_display, _ = _evaluate_kl_scale(
-                    state.get("kl_scale", kl_scale_spec), current_kd_temperature
+            if logits_t.shape != logits_s_fp32.shape:
+                raise RuntimeError(
+                    "Teacher and student logits shapes do not match: "
+                    f"teacher={tuple(logits_t.shape)} student={tuple(logits_s_fp32.shape)}"
                 )
-                kl_scale_value = float(kl_scale_value)
-                state["kl_scale_resolved"] = kl_scale_display
-
-                logprob_s_temp = torch.nn.functional.log_softmax(
-                    logits_s / current_kd_temperature, dim=-1
-                )
-                prob_t = torch.nn.functional.softmax(
-                    logits_t / current_kd_temperature, dim=-1
-                )
-                loss_kd = torch.nn.functional.kl_div(
-                    logprob_s_temp, prob_t, reduction="batchmean"
-                ) * kl_scale_value
-
-                with torch.no_grad():
-                    logprob_t_temp = torch.nn.functional.log_softmax(
-                        logits_t / current_kd_temperature, dim=-1
-                    )
-                    prob_s = torch.nn.functional.softmax(
-                        logits_s_detached / current_kd_temperature, dim=-1
-                    )
-                    reverse_kd = float(
-                        torch.nn.functional.kl_div(
-                            logprob_t_temp, prob_s, reduction="batchmean"
-                        )
-                        * kl_scale_value
-                    )
-                    mse_logits = float(
-                        torch.nn.functional.mse_loss(logits_s, logits_t, reduction="mean")
-                    )
-                    logprob_corr_value = _token_logprob_corr(
-                        logprob_t_temp, logprob_s_temp.detach()
-                    )
-
-                    teacher_logprob_base = torch.nn.functional.log_softmax(
-                        logits_t.float(), dim=-1
-                    )
-                    teacher_prob_base = teacher_logprob_base.exp()
-                    teacher_entropy_sum = float(
-                        (-(teacher_prob_base * teacher_logprob_base).sum(dim=-1)).sum().item()
-                    )
-
-                combined_loss = (1 - current_kd_alpha) * loss_ce + current_kd_alpha * loss_kd
-            else:
-                combined_loss = loss_ce
 
             with torch.no_grad():
-                student_logprob_base = torch.nn.functional.log_softmax(
-                    logits_s_detached.float(), dim=-1
+                match_tensor = (
+                    logits_s_detached.argmax(dim=-1) == logits_t.argmax(dim=-1)
+                ).float().mean()
+                top1_match_value = float(match_tensor.item())
+
+                k_top = min(5, logits_t.size(-1))
+                if k_top > 0:
+                    student_topk = torch.topk(logits_s_detached, k=k_top, dim=-1).indices
+                    teacher_topk = torch.topk(logits_t, k=k_top, dim=-1).indices
+                    overlap = torch.isin(teacher_topk, student_topk)
+                    top5_match_value = float(overlap.float().mean().item())
+
+            kl_scale_value, kl_scale_display, _ = _evaluate_kl_scale(
+                state.get("kl_scale", kl_scale_spec), current_kd_temperature
+            )
+            kl_scale_value = float(kl_scale_value)
+            state["kl_scale_resolved"] = kl_scale_display
+
+            logprob_s_temp = torch.nn.functional.log_softmax(
+                logits_s_fp32 / current_kd_temperature, dim=-1
+            )
+            prob_t = torch.nn.functional.softmax(
+                logits_t / current_kd_temperature, dim=-1
+            )
+            loss_kd = torch.nn.functional.kl_div(
+                logprob_s_temp, prob_t, reduction="batchmean"
+            ) * kl_scale_value
+
+            with torch.no_grad():
+                logprob_t_temp = torch.nn.functional.log_softmax(
+                    logits_t / current_kd_temperature, dim=-1
                 )
-                student_prob_base = student_logprob_base.exp()
-                student_entropy_sum = float(
-                    (-(student_prob_base * student_logprob_base).sum(dim=-1)).sum().item()
+                prob_s = torch.nn.functional.softmax(
+                    logits_s_detached / current_kd_temperature, dim=-1
                 )
+                reverse_kd = float(
+                    torch.nn.functional.kl_div(
+                        logprob_t_temp, prob_s, reduction="batchmean"
+                    )
+                    * kl_scale_value
+                )
+                mse_logits = float(
+                    torch.nn.functional.mse_loss(logits_s_fp32, logits_t, reduction="mean")
+                )
+                logprob_corr_value = _token_logprob_corr(
+                    logprob_t_temp, logprob_s_temp.detach()
+                )
+
+                teacher_logprob_base = torch.nn.functional.log_softmax(
+                    logits_t.float(), dim=-1
+                )
+                teacher_prob_base = teacher_logprob_base.exp()
+                teacher_entropy_sum = float(
+                    (-(teacher_prob_base * teacher_logprob_base).sum(dim=-1)).sum().item()
+                )
+
+            combined_loss = (1 - current_kd_alpha) * loss_ce + current_kd_alpha * loss_kd
+        else:
+            combined_loss = loss_ce
+
+        with torch.no_grad():
+            student_logprob_base = torch.nn.functional.log_softmax(
+                logits_s_detached.float(), dim=-1
+            )
+            student_prob_base = student_logprob_base.exp()
+            student_entropy_sum = float(
+                (-(student_prob_base * student_logprob_base).sum(dim=-1)).sum().item()
+            )
 
         loss_ce_value = float(loss_ce.detach())
         loss_kd_value = float(loss_kd.detach()) if loss_kd is not None else 0.0
@@ -826,7 +865,12 @@ def train_loop(state):
         if step % eval_every == 0:
             model.eval()
             eval_t0 = time.time()
-            metrics = evaluate(model, val_loader, device=device)
+            metrics = evaluate(
+                model,
+                val_loader,
+                device=device,
+                autocast_dtype=eval_autocast_dtype if device_type == "cuda" else None,
+            )
             eval_time = time.time() - eval_t0
             val_loss = float(metrics["val_loss"])
             teacher_metrics = state.get("teacher_metrics")
@@ -858,7 +902,12 @@ def train_loop(state):
                         ctx_metrics = metrics
                     else:
                         ctx_eval_t0 = time.time()
-                        ctx_metrics = evaluate(model, loader, device=device)
+                        ctx_metrics = evaluate(
+                            model,
+                            loader,
+                            device=device,
+                            autocast_dtype=eval_autocast_dtype if device_type == "cuda" else None,
+                        )
                         ctx_eval_time = time.time() - ctx_eval_t0
                     ctx_stats = {
                         "step": step,

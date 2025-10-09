@@ -20,6 +20,27 @@ from ..io.checkpoints import load_from_uri, save_and_maybe_upload
 from trainer.schedules import build_scalar_schedule
 
 
+def _normalize_precision(value: str | None) -> str:
+    if not value:
+        return "no"
+    return str(value).strip().lower()
+
+
+def _precision_to_dtype(value: str | None):
+    if not value:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"fp16", "float16", "half"}:
+        return torch.float16
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if normalized in {"fp32", "float32", "f32"}:
+        return torch.float32
+    if normalized in {"no", "none", "off"}:
+        return None
+    return None
+
+
 def _expand_output_uri(output_gcs_uri: str | None) -> str | None:
     """
     Vertex passes job args directly to Python, so any shell substitutions
@@ -78,6 +99,7 @@ def run_training(
     reset_lrsched_on_resume: bool = False,
     kd_scheme: str | None = None,
     kl_scale: str | None = None,
+    teacher_precision: str | None = None,
 ):
     log = get_logger("stage0")
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -400,6 +422,28 @@ def run_training(
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{random.getrandbits(16):04x}"
 
+    precision_value = _normalize_precision(precision)
+    if precision_value not in {"fp16", "bf16", "float16", "bfloat16", "fp32", "float32", "half", "f32"}:
+        if precision_value not in {"no", "none", "off"}:
+            log.warning("[precision] Unrecognized precision '%s'; defaulting to 'no'", precision)
+        precision_value = "no"
+
+    if teacher_precision is None:
+        teacher_precision_value = "fp16" if device == "cuda" else "fp32"
+    else:
+        teacher_precision_value = _normalize_precision(teacher_precision)
+        if teacher_precision_value in {"no", "none", "off"}:
+            teacher_precision_value = "no"
+    if teacher_precision_value == "no":
+        teacher_precision_value = "fp16" if device == "cuda" else "fp32"
+
+    eval_autocast_dtype = _precision_to_dtype(precision_value) if device == "cuda" else None
+    teacher_autocast_dtype = _precision_to_dtype(teacher_precision_value) if device == "cuda" else None
+    if eval_autocast_dtype == torch.float32:
+        eval_autocast_dtype = None
+    if teacher_autocast_dtype == torch.float32:
+        teacher_autocast_dtype = None
+
     state = dict(
         model=student,
         device=device,
@@ -417,7 +461,10 @@ def run_training(
         ckptio=save_and_maybe_upload,
         local_outdir=str(local_outdir),
         gcs_outdir=gcs_outdir,
-        precision=precision,
+        precision=precision_value,
+        teacher_precision=teacher_precision_value,
+        teacher_autocast_dtype=teacher_autocast_dtype,
+        eval_autocast_dtype=eval_autocast_dtype,
         step=resume_step,
         global_step=resume_step,
         phase_base=int(phase_base),
@@ -477,6 +524,7 @@ def run_training(
             "temp_schedule_spec": state.get("kd_temperature_schedule_spec"),
             "kd_scheme": state.get("kd_scheme"),
             "kl_scale": state.get("kl_scale"),
+            "teacher_precision": state.get("teacher_precision"),
         }
         meta = {
             "block_size": state.get("block_size"),
@@ -497,6 +545,7 @@ def run_training(
             "save_every_steps": state.get("save_every_steps"),
             "kd_scheme": state.get("kd_scheme"),
             "kl_scale": state.get("kl_scale"),
+            "teacher_precision": state.get("teacher_precision"),
         }
         meta = {k: v for k, v in meta.items() if v is not None}
         return {"trainer_state": trainer_state, "meta": meta}

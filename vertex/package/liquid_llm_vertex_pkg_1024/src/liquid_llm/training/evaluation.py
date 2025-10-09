@@ -1,4 +1,5 @@
 import torch
+from contextlib import nullcontext
 
 from .metrics import Meter, cross_entropy
 
@@ -11,18 +12,32 @@ def _extract_logits(output):
 
 
 @torch.no_grad()
-def evaluate(model, val_loader, device: str = "cuda"):
+def evaluate(model, val_loader, device: str = "cuda", autocast_dtype=None):
     was_training = model.training
     model.eval()
     meter = Meter()
     total_tokens = 0
     total_examples = 0
     total_batches = 0
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    use_autocast = False
+    if isinstance(autocast_dtype, torch.dtype):
+        if device_type == "cuda":
+            use_autocast = True
+        elif device_type == "cpu" and autocast_dtype == torch.bfloat16:
+            use_autocast = True
     for batch in val_loader:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
-        output = model(input_ids)
-        logits = _extract_logits(output)
+        autocast_cm = (
+            torch.autocast(device_type=device_type, dtype=autocast_dtype)
+            if use_autocast
+            else nullcontext()
+        )
+        with autocast_cm:
+            output = model(input_ids)
+            logits = _extract_logits(output)
+        logits = logits.float()
         loss = cross_entropy(logits, labels)
         contrib_tokens = int((labels != -100).sum().item())
         if contrib_tokens == 0:
