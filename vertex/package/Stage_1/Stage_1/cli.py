@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import uuid
 
 from .trainer import Stage1Trainer
@@ -18,7 +19,10 @@ def main(argv: list[str] | None = None) -> None:
     if not config.resume_gcs_uri:
         raise SystemExit("Stage-1 requires --resume_gcs_uri=gs://.../stage1_surgery_*.pt")
     if "surgery" not in config.resume_gcs_uri:
-        raise SystemExit("--resume_gcs_uri must reference a post-surgery checkpoint (stage1_surgery_*.pt)")
+        print(
+            "[stage1-cli] WARNING: --resume_gcs_uri does not look like a post-surgery checkpoint.",
+            file=sys.stderr,
+        )
     if config.output_gcs_uri and not config.output_gcs_uri.startswith("gs://"):
         ensure_output_path(config.output_gcs_uri)
     trainer = Stage1Trainer(config)

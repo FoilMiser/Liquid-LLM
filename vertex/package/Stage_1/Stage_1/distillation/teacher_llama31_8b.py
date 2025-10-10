@@ -56,7 +56,14 @@ class TeacherModel:
         if AutoModelForCausalLM is None or AutoTokenizer is None:
             raise ImportError("transformers package is required for local teacher inference")
 
-        token = config.hf_token or get_hf_token(config.hf_secret_name)
+        token = config.hf_token
+        if token is None and config.hf_secret_name:
+            try:
+                token = get_hf_token(config.hf_secret_name)
+            except ValueError as exc:  # pragma: no cover - requires misconfiguration
+                LOGGER.warning("Unable to resolve HF token without project id", exc_info=exc)
+            except Exception as exc:  # pragma: no cover - secret manager failures
+                LOGGER.warning("Failed to resolve HF token from secret", exc_info=exc)
         auth_kwargs = {}
         if token:
             auth_kwargs["use_auth_token"] = token

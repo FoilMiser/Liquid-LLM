@@ -18,7 +18,7 @@ from .distillation import DistillationConfig, DistillationLoss, TeacherConfig, T
 from .monitoring import HealthMonitor, MetricAggregator, StructuredLogger
 from .models import ModelConfig, Stage1Model, load_stage1_checkpoint
 from .models.blocks import ClassicBlock
-from .utils import WarmupCosineScheduler, config_to_dict, ensure_output_path
+from .utils import WarmupCosineScheduler, config_to_dict, ensure_output_path, get_hf_token
 from .data import DataMixer, load_manifest
 from .tools import ToolTraceInjector
 
@@ -89,6 +89,20 @@ class Stage1Trainer:
         )
         self.distillation = DistillationLoss(distil_cfg, total_steps=config.max_steps)
 
+        project_id = self._detect_project_id()
+        hf_token = None
+        secret_name = getattr(config, "hf_secret_name", None)
+        if secret_name:
+            try:
+                hf_token = get_hf_token(secret_name, project_id=project_id)
+            except ValueError as exc:
+                self.logger.health("warning", "hf_secret_project_missing", detail=str(exc))
+            except Exception as exc:  # pragma: no cover - secret manager failure
+                self.logger.health("warning", "hf_secret_unavailable", detail=str(exc))
+        if hf_token:
+            for env_key in ("HF_TOKEN", "HF_API_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
+                os.environ.setdefault(env_key, hf_token)
+
         self.teacher: Optional[TeacherModel] = None
         teacher_id = self._resolve_teacher_id()
         teacher_endpoint = getattr(config, "teacher_endpoint", None)
@@ -96,7 +110,8 @@ class Stage1Trainer:
             teacher_cfg = TeacherConfig(
                 model_id=teacher_id,
                 endpoint=teacher_endpoint,
-                hf_secret_name=config.hf_secret_name,
+                hf_secret_name=secret_name,
+                hf_token=hf_token,
                 hf_cache_dir=getattr(config, "hf_cache_dir", None),
                 device=config.device,
                 max_batch_size=getattr(config, "teacher_max_batch_size", 0),
@@ -163,6 +178,19 @@ class Stage1Trainer:
             "llama-3.1-8b-instruct": "meta-llama/Meta-Llama-3.1-8B-Instruct",
         }
         return known.get(alias, "meta-llama/Meta-Llama-3.1-8B")
+
+    def _detect_project_id(self) -> Optional[str]:
+        for env_key in (
+            "AIP_PROJECT_ID",
+            "GOOGLE_CLOUD_PROJECT",
+            "PROJECT_ID",
+            "CLOUD_ML_PROJECT_ID",
+            "GCLOUD_PROJECT",
+        ):
+            value = os.getenv(env_key)
+            if value:
+                return value
+        return None
 
     def _log_startup(self) -> None:
         mem = torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
