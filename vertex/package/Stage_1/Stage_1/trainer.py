@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import time
@@ -205,6 +206,30 @@ class Stage1Trainer:
             step=metadata.step,
             val_perplexity=metadata.metric_value,
         )
+
+        if self.config.use_checkpoint_saver:
+            restored_metric = metadata.metrics.get(self.config.best_metric)
+            if restored_metric is None and self.config.best_metric == "val_perplexity":
+                restored_metric = metadata.metric_value
+            if restored_metric is not None:
+                restored_metric = float(restored_metric)
+                if math.isnan(restored_metric):
+                    self.logger.health(
+                        "warning",
+                        "resume_metric_nan",
+                        detail=(
+                            "Best checkpoint metric restored as NaN; subsequent evaluations will overwrite "
+                            "the checkpoint once a finite metric is observed."
+                        ),
+                    )
+                else:
+                    self.saver.best_value = restored_metric
+                    if self.logger:
+                        self.logger.info(
+                            "checkpoint_best_restored",
+                            metric=self.config.best_metric,
+                            value=restored_metric,
+                        )
 
     # ------------------------------------------------------------------
     def _fake_batch(self, batch_size: int) -> Dict[str, torch.Tensor]:
