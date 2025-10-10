@@ -22,6 +22,9 @@ class Stage1Config:
     resume_gcs_uri: Optional[str] = None
     output_gcs_uri: Optional[str] = None
     teacher: str = "llama-3.1-8b"
+    teacher_id: str = "meta-llama/Meta-Llama-3.1-8B"
+    teacher_endpoint: Optional[str] = None
+    teacher_max_batch_size: int = 0
     seq_len: int = 1024
     net2net_width_pct: float = 10.0
     add_blocks_classic: int = 2
@@ -134,6 +137,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume_gcs_uri", type=str, required=False)
     parser.add_argument("--output_gcs_uri", type=str, required=False)
     parser.add_argument("--teacher", type=str, default="llama-3.1-8b")
+    parser.add_argument("--teacher_id", type=str, default="meta-llama/Meta-Llama-3.1-8B")
+    parser.add_argument("--teacher_endpoint", type=str, default=None)
+    parser.add_argument("--teacher_max_batch_size", type=int, default=0)
     parser.add_argument("--seq_len", type=int, default=1024)
     parser.add_argument("--net2net_width_pct", type=float, default=10.0)
     parser.add_argument("--add_blocks_classic", type=int, default=2)

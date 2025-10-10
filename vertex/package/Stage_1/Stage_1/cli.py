@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import uuid
 
@@ -16,6 +15,10 @@ def main(argv: list[str] | None = None) -> None:
     config = build_config(args)
     if not config.run_id:
         config.run_id = str(uuid.uuid4())
+    if not config.resume_gcs_uri:
+        raise SystemExit("Stage-1 requires --resume_gcs_uri=gs://.../stage1_surgery_*.pt")
+    if "surgery" not in config.resume_gcs_uri:
+        raise SystemExit("--resume_gcs_uri must reference a post-surgery checkpoint (stage1_surgery_*.pt)")
     if config.output_gcs_uri and not config.output_gcs_uri.startswith("gs://"):
         ensure_output_path(config.output_gcs_uri)
     trainer = Stage1Trainer(config)

@@ -1,4 +1,4 @@
---resume_gcs_uri=>>>PASTE_STAGE0_OR_STAGE1_START_CKPT<<<
+--resume_gcs_uri=>>>PASTE_POST_SURGERY_CKPT_GCS_URI<<<
 --output_gcs_uri=gs://liquid-llm-bucket-2/stage1/checkpoints/vertex_runs/$(date +%Y%m%d-%H%M%S)
 --teacher=llama-3.1-8b
 --seq_len=1024
