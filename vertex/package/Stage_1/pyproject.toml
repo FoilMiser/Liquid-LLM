@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Stage-1"
+version = "0.1.0"
+description = "Stage-1 Vertex AI training package for Liquid LLM"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["Stage_1"]
+include = ["Stage_1*"]
+
+[project.scripts]
+stage1-train = "Stage_1.cli:main"
