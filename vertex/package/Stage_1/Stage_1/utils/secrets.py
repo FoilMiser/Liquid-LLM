@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Optional
 
 try:
@@ -37,4 +38,21 @@ def get_secret(secret_name: str, project_id: Optional[str] = None) -> Optional[s
     return payload
 
 
-__all__ = ["get_secret"]
+def get_hf_token(secret_name: Optional[str], project_id: Optional[str] = None) -> Optional[str]:
+    """Resolve a Hugging Face token from env vars or Secret Manager."""
+
+    for env_var in ("HF_TOKEN", "HF_API_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
+        value = os.getenv(env_var)
+        if value:
+            return value.strip()
+
+    if not secret_name:
+        return None
+
+    token = get_secret(secret_name, project_id=project_id)
+    if token:
+        return token.strip()
+    return None
+
+
+__all__ = ["get_secret", "get_hf_token"]

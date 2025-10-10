@@ -10,7 +10,7 @@ from .config_utils import (
 )
 from .schedule import WarmupCosineScheduler
 from .io import open_sharded_file, write_jsonl
-from .secrets import get_secret
+from .secrets import get_secret, get_hf_token
 from .ddp import setup_ddp, cleanup_ddp
 
 __all__ = [
@@ -24,6 +24,7 @@ __all__ = [
     "open_sharded_file",
     "write_jsonl",
     "get_secret",
+    "get_hf_token",
     "setup_ddp",
     "cleanup_ddp",
 ]
