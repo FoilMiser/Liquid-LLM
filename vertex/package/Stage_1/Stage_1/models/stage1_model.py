@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import io
-import json
-import os
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -13,7 +11,7 @@ import torch.nn as nn
 from torch.utils import checkpoint as checkpoint_utils
 
 from ..utils.io import open_sharded_file
-from .blocks import ClassicBlock, LiquidBlock
+from .blocks import LiquidBlock
 from .config import ModelConfig
 
 
@@ -29,12 +27,12 @@ class CheckpointMetadata:
 
 
 class Stage1Model(nn.Module):
-    """Transformer language model widened and deepened for Stage-1."""
+    """Transformer language model used for Stage-1."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.d_model = config.widened_dim()
+        self.d_model = config.d_model
         self.token_embed = nn.Embedding(config.vocab_size, self.d_model)
         self.pos_embed = nn.Parameter(torch.zeros(1, config.max_seq_len, self.d_model))
         self.dropout = nn.Dropout(config.dropout)
@@ -49,24 +47,6 @@ class Stage1Model(nn.Module):
                 layer_norm_eps=config.layer_norm_eps,
             )
             for _ in range(config.n_layers)
-        )
-        blocks.extend(
-            ClassicBlock(
-                self.d_model,
-                config.n_heads,
-                dropout=config.dropout,
-                layer_norm_eps=config.layer_norm_eps,
-            )
-            for _ in range(config.add_classic)
-        )
-        blocks.extend(
-            LiquidBlock(
-                self.d_model,
-                config.n_heads,
-                dropout=config.dropout,
-                layer_norm_eps=config.layer_norm_eps,
-            )
-            for _ in range(config.add_liquid)
         )
         self.blocks = nn.ModuleList(blocks)
         self.norm = nn.LayerNorm(self.d_model, eps=config.layer_norm_eps)
@@ -124,17 +104,6 @@ class Stage1Model(nn.Module):
             generated = torch.cat([generated, next_token], dim=1)
         return generated
 
-    def write_freeze_mask(self, output_dir: str | None) -> None:
-        mask = {
-            f"blocks.{idx}": isinstance(block, ClassicBlock)
-            for idx, block in enumerate(self.blocks)
-        }
-        target_dir = output_dir or "."
-        path = os.path.join(target_dir, "freeze_mask.json")
-        with open_sharded_file(path, "w") as handle:
-            json.dump(mask, handle, indent=2, sort_keys=True)
-
-
 # ----------------------------------------------------------------------
 # Checkpoint helpers
 # ----------------------------------------------------------------------
@@ -174,8 +143,7 @@ def _validate_checkpoint_shapes(
     if checkpoint_width != expected_width:
         raise ValueError(
             "Checkpoint hidden width mismatch: expected "
-            f"{expected_width}, found {checkpoint_width}. Ensure the post-surgery checkpoint was produced"
-            " with the same widen_pct and head configuration."
+            f"{expected_width}, found {checkpoint_width}."
         )
 
     checkpoint_blocks = _infer_block_count(state_dict)
@@ -203,7 +171,7 @@ def load_stage1_checkpoint(
     checkpoint_path: str,
     device: torch.device | str | None = None,
 ) -> CheckpointMetadata:
-    """Load a post-surgery Stage-1 checkpoint into ``model``.
+    """Load a Stage-1 checkpoint into ``model``.
 
     The loader validates the depth/width of the checkpoint before loading it in ``strict``
     mode. ``checkpoint_path`` may point to a local file or to a GCS URI.

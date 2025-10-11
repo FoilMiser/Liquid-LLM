@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Iterable, List
+from typing import List
+
+from ..utils import open_sharded_file
 
 
 @dataclass
@@ -12,17 +14,25 @@ class ManifestEntry:
     path: str
     type: str
     weight: float
+    dataset: str | None = None
 
 
 def load_manifest(path: str) -> List[ManifestEntry]:
     entries: List[ManifestEntry] = []
-    with open(path, "r", encoding="utf-8") as f:
+    with open_sharded_file(path, "r") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             data = json.loads(line)
-            entries.append(ManifestEntry(path=data["path"], type=data["type"], weight=float(data["weight"])))
+            entries.append(
+                ManifestEntry(
+                    path=data["path"],
+                    type=data.get("type", "lm"),
+                    weight=float(data["weight"]),
+                    dataset=data.get("dataset"),
+                )
+            )
     return entries
 
 

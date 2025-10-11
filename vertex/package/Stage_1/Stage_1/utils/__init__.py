@@ -9,7 +9,7 @@ from .config_utils import (
     dump_config,
 )
 from .schedule import WarmupCosineScheduler
-from .io import open_sharded_file, write_jsonl
+from .io import open_sharded_file, path_exists, resolve_glob_paths, write_jsonl
 from .secrets import get_secret, get_hf_token
 from .ddp import setup_ddp, cleanup_ddp
 
@@ -23,6 +23,8 @@ __all__ = [
     "WarmupCosineScheduler",
     "open_sharded_file",
     "write_jsonl",
+    "path_exists",
+    "resolve_glob_paths",
     "get_secret",
     "get_hf_token",
     "setup_ddp",
