@@ -9,19 +9,21 @@ description = "Stage-1 Vertex AI training package for Liquid LLM"
 requires-python = ">=3.10"
 dependencies = [
     "torch==2.3.1",
+    "transformers==4.57.0",
+    "tokenizers==0.22.1",
+    "datasets==2.20.0",
+    "pyarrow==16.1.0",
+    "huggingface_hub==0.35.3",
+    "accelerate==1.10.1",
+    "google-cloud-secret-manager==2.24.0",
+    "google-cloud-storage==2.18.2",
     "einops==0.8.0",
     "numpy==1.26.4",
+    "safetensors==0.6.2",
+    "sentencepiece==0.2.1",
     "tqdm==4.66.4",
+    "python-json-logger>=2.0.7",
     "pyyaml==6.0.2",
-    "transformers>=4.42.0",
-    "accelerate>=0.30.0",
-    "sentencepiece>=0.2.0",
-    "datasets>=2.20.0",
-    "huggingface_hub>=0.23.0",
-    "tokenizers>=0.15.2",
-    "google-cloud-storage>=2.17.0",
-    "google-cloud-secret-manager>=2.20.0",
-    "python-json-logger>=3.2.1",
 ]
 
 [tool.setuptools]

@@ -1,4 +1,4 @@
-"""Training loop for Stage-1."""
+"""Stage-1 training loop implementation."""
 
 from __future__ import annotations
 
@@ -7,20 +7,19 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Iterator, Optional
 
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
+from transformers import AutoTokenizer
 
 from .checkpoints import BestCheckpointSaver
+from .data import DataMixer, load_manifest
 from .distillation import DistillationConfig, DistillationLoss, TeacherConfig, TeacherModel
 from .monitoring import HealthMonitor, MetricAggregator, StructuredLogger
 from .models import ModelConfig, Stage1Model, load_stage1_checkpoint
-from .models.blocks import ClassicBlock
 from .utils import WarmupCosineScheduler, config_to_dict, ensure_output_path, get_hf_token
-from .data import DataMixer, load_manifest
-from .tools import ToolTraceInjector
 
 
 @dataclass
@@ -31,32 +30,14 @@ class TrainerState:
 class Stage1Trainer:
     def __init__(self, config, device: Optional[torch.device] = None):
         if not config.resume_gcs_uri:
-            raise ValueError(
-                "Stage-1 training requires --resume_gcs_uri to point to a post-surgery checkpoint."
-            )
+            raise ValueError("Stage-1 training requires --resume_gcs_uri to point to a checkpoint.")
 
         self.config = config
         self.device = device or torch.device(config.device if torch.cuda.is_available() else "cpu")
-        self.dtype = torch.bfloat16 if (config.precision == "bfloat16" and self.device.type == "cuda") else torch.float32
-        self.model_config = ModelConfig(
-            max_seq_len=config.seq_len,
-            widen_pct=config.net2net_width_pct,
-            add_classic=config.add_blocks_classic,
-            add_liquid=config.add_blocks_liquid,
-            gradient_checkpointing=config.use_grad_ckpt,
-        )
-        self.model = Stage1Model(self.model_config).to(self.device)
-        if self.dtype == torch.bfloat16:
-            self.model = self.model.to(dtype=torch.bfloat16)
+        self.dtype = self._select_dtype(config.dtype, self.device)
 
-        betas = tuple(float(x) for x in str(config.betas).split(","))
-        self.optimizer = AdamW(self.model.parameters(), lr=config.lr, betas=betas, weight_decay=config.weight_decay)
-        self.scheduler = WarmupCosineScheduler(
-            self.optimizer,
-            warmup_steps=config.warmup_steps,
-            total_steps=config.max_steps,
-        )
-        self.state = TrainerState()
+        if config.block_size > config.seq_len:
+            raise ValueError("block_size must be less than or equal to seq_len")
 
         self.output_path = config.output_gcs_uri or "./stage1_output"
         if self.output_path and not self.output_path.startswith("gs://"):
@@ -65,9 +46,55 @@ class Stage1Trainer:
         self.logger = StructuredLogger(self.output_path, run_id=config.run_id, git_sha=self._git_sha())
         self.health = HealthMonitor(self.logger, max_grad_norm=config.max_grad_norm)
 
-        if getattr(config, "do_surgery", False):
-            self.logger.health("warning", "surgery_disabled", detail="Stage-1 skips surgery by design")
-            config.do_surgery = False
+        self._tokens_since_log = 0
+        self._last_log_time = time.time()
+        self.last_tokens_per_sec = 0.0
+        self.last_gpu_mem = 0.0
+        self.last_grad_norm = 0.0
+
+        if self.device.type == "cuda":
+            self._configure_sdp()
+
+        project_id = self._detect_project_id()
+        secret_name = getattr(config, "hf_secret_name", None)
+        hf_token = None
+        if secret_name:
+            try:
+                hf_token = get_hf_token(secret_name, project_id=project_id)
+            except ValueError as exc:
+                self.logger.health("warning", "hf_secret_project_missing", detail=str(exc))
+            except Exception as exc:  # pragma: no cover - secret manager failure
+                self.logger.health("warning", "hf_secret_unavailable", detail=str(exc))
+        if hf_token:
+            for env_key in ("HF_TOKEN", "HF_API_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
+                os.environ.setdefault(env_key, hf_token)
+
+        self.tokenizer = self._load_tokenizer(config.tokenizer_name, hf_token)
+        vocab_size = len(self.tokenizer)
+
+        self.model_config = ModelConfig(
+            vocab_size=vocab_size,
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_layers=config.n_layers,
+            max_seq_len=config.seq_len,
+            dropout=config.dropout,
+            layer_norm_eps=config.layer_norm_eps,
+            gradient_checkpointing=config.use_grad_ckpt,
+            use_flash_attn=config.use_flash_attn,
+        )
+        self.model = Stage1Model(self.model_config).to(self.device)
+        if self.dtype != torch.float32:
+            self.model = self.model.to(dtype=self.dtype)
+
+        betas = tuple(float(x) for x in str(config.betas).split(","))
+        self.optimizer = AdamW(self.model.parameters(), lr=config.lr, betas=betas, weight_decay=config.weight_decay)
+        self.scheduler = WarmupCosineScheduler(
+            self.optimizer,
+            warmup_steps=config.warmup_steps,
+            total_steps=config.train_steps,
+        )
+        self.state = TrainerState()
 
         if config.best_metric != "val_perplexity" or config.best_metric_mode != "min":
             self.logger.info(
@@ -87,44 +114,32 @@ class Stage1Trainer:
             keep_old_logit_l2_fade_step=config.keep_old_logit_l2_fade_step,
             keep_old_logit_l2_enable=config.keep_old_logit_l2_enable,
         )
-        self.distillation = DistillationLoss(distil_cfg, total_steps=config.max_steps)
+        self.distillation = DistillationLoss(distil_cfg, total_steps=config.train_steps)
 
-        project_id = self._detect_project_id()
-        hf_token = None
-        secret_name = getattr(config, "hf_secret_name", None)
-        if secret_name:
-            try:
-                hf_token = get_hf_token(secret_name, project_id=project_id)
-            except ValueError as exc:
-                self.logger.health("warning", "hf_secret_project_missing", detail=str(exc))
-            except Exception as exc:  # pragma: no cover - secret manager failure
-                self.logger.health("warning", "hf_secret_unavailable", detail=str(exc))
-        if hf_token:
-            for env_key in ("HF_TOKEN", "HF_API_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
-                os.environ.setdefault(env_key, hf_token)
-
-        self.teacher: Optional[TeacherModel] = None
         teacher_id = self._resolve_teacher_id()
-        teacher_endpoint = getattr(config, "teacher_endpoint", None)
-        if (teacher_id or teacher_endpoint) and str(config.teacher).lower() != "none":
+        self.teacher: Optional[TeacherModel] = None
+        if teacher_id or config.teacher_endpoint:
             teacher_cfg = TeacherConfig(
-                model_id=teacher_id,
-                endpoint=teacher_endpoint,
+                model_id=teacher_id or "meta-llama/Meta-Llama-3.1-8B",
+                endpoint=config.teacher_endpoint,
                 hf_secret_name=secret_name,
                 hf_token=hf_token,
                 hf_cache_dir=getattr(config, "hf_cache_dir", None),
                 device=config.device,
-                max_batch_size=getattr(config, "teacher_max_batch_size", 0),
+                max_batch_size=int(getattr(config, "teacher_max_batch_size", 0)),
             )
             try:
                 self.teacher = TeacherModel(teacher_cfg)
-            except Exception as exc:  # pragma: no cover - external dependency
+            except Exception as exc:  # pragma: no cover - external dependency failures
                 self.logger.health("warning", "teacher_unavailable", error=str(exc))
                 self.teacher = None
 
-        self.old_logit_reference = None
-        if getattr(config, "use_old_logit_reference", None):
-            self.old_logit_reference = torch.load(config.use_old_logit_reference, map_location="cpu")
+        if not config.dataset_cfg:
+            raise ValueError("Stage-1 training requires --dataset_cfg pointing to a manifest JSONL file.")
+        manifest = load_manifest(config.dataset_cfg)
+        self.mixer = DataMixer(manifest, tool_ratio=config.tool_use_ratio, seed=config.seed)
+        self.sample_iterator: Iterator[dict] = self.mixer.iter_samples()
+        self.logger.info("dataset_mix", summary=self.mixer.summary())
 
         self.saver = BestCheckpointSaver(
             self.output_path,
@@ -133,51 +148,68 @@ class Stage1Trainer:
             logger=self.logger,
         )
 
-        self.mixer = None
-        if config.dataset_cfg and os.path.exists(config.dataset_cfg):
-            manifest = load_manifest(config.dataset_cfg)
-            self.mixer = DataMixer(manifest, tool_ratio=config.tool_use_ratio, seed=config.seed)
-            self.logger.info("dataset_mix", weights=self.mixer.summary())
-        elif config.dataset_cfg:
-            self.logger.info("dataset_manifest_remote", path=config.dataset_cfg)
-        self.sample_iterator = self.mixer.iter_samples() if self.mixer else None
         self._logged_sources: set[str] = set()
-
-        self.tool_injector = (
-            ToolTraceInjector(
-                calculator_enabled=config.calculator_enabled,
-                scratchpad_enabled=config.scratchpad_enabled,
-                max_calls=max(1, int(config.seq_len * config.tool_use_ratio)),
-            )
-            if (config.calculator_enabled or config.scratchpad_enabled)
-            else None
-        )
-
-        self.last_tokens_per_sec = 0.0
-        self.last_gpu_mem = 0.0
-        self.last_grad_norm = 0.0
-        self._last_log_time = time.time()
 
         self._log_startup()
         self._resume_from_checkpoint()
 
     # ------------------------------------------------------------------
+    def _select_dtype(self, dtype: str, device: torch.device) -> torch.dtype:
+        if device.type != "cuda":
+            return torch.float32
+        lowered = str(dtype).lower()
+        if lowered in {"bfloat16", "bf16"}:
+            return torch.bfloat16
+        if lowered in {"float16", "fp16"}:
+            return torch.float16
+        return torch.float32
+
+    def _configure_sdp(self) -> None:
+        try:
+            torch.backends.cuda.sdp_kernel(  # type: ignore[attr-defined]
+                enable_flash=self.config.use_flash_attn,
+                enable_math=not self.config.use_flash_attn,
+                enable_mem_efficient=not self.config.use_flash_attn,
+            )
+        except Exception:  # pragma: no cover - defensive, kernels vary by runtime
+            pass
+
+    def _load_tokenizer(self, tokenizer_name: str, hf_token: Optional[str]):
+        auth_kwargs: Dict[str, object] = {}
+        if hf_token:
+            auth_kwargs["use_auth_token"] = hf_token
+        if getattr(self.config, "hf_cache_dir", None):
+            auth_kwargs["cache_dir"] = self.config.hf_cache_dir
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **auth_kwargs)
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        return tokenizer
+
     def _git_sha(self) -> Optional[str]:
         try:
             return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.getcwd()).decode().strip()
-        except Exception:  # pragma: no cover - git not available
+        except Exception:  # pragma: no cover - git not always available
             return None
 
-    def _resolve_teacher_id(self) -> str:
-        requested = getattr(self.config, "teacher_id", None)
-        if requested and str(requested).lower() != "none":
-            return requested
-        alias = str(getattr(self.config, "teacher", "")).lower()
-        known = {
-            "llama-3.1-8b": "meta-llama/Meta-Llama-3.1-8B",
-            "llama-3.1-8b-instruct": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    def _resolve_teacher_id(self) -> Optional[str]:
+        name = getattr(self.config, "teacher_name", None)
+        if not name:
+            return "meta-llama/Meta-Llama-3.1-8B"
+        lowered = str(name).lower()
+        if lowered in {"none", "null"}:
+            return None
+        canonical_id = "meta-llama/Meta-Llama-3.1-8B"
+        if lowered == canonical_id.lower():
+            return canonical_id
+        aliases = {
+            "meta-llama/meta-llama-3.1-8b": canonical_id,
+            "meta-llama/meta-llama-3.1-8b-instruct": canonical_id,
+            "llama-3.1-8b": canonical_id,
         }
-        return known.get(alias, "meta-llama/Meta-Llama-3.1-8B")
+        if lowered in aliases:
+            return aliases[lowered]
+        raise ValueError("Stage-1 distillation currently supports only Meta-Llama-3.1-8B as the teacher model")
 
     def _detect_project_id(self) -> Optional[str]:
         for env_key in (
@@ -199,10 +231,12 @@ class Stage1Trainer:
             device=str(self.device),
             vram=mem,
             seq_len=self.config.seq_len,
-            d_model=self.model_config.widened_dim(),
-            n_layers=self.model_config.total_layers(),
-            freeze_classic_after=self.config.freeze_classic_after,
+            block_size=self.config.block_size,
+            d_model=self.model_config.d_model,
+            n_layers=self.model_config.n_layers,
             use_flash_attn=self.config.use_flash_attn,
+            use_grad_ckpt=self.config.use_grad_ckpt,
+            throughput_target=self.config.throughput_tokens,
         )
 
     def _resume_from_checkpoint(self) -> None:
@@ -252,70 +286,78 @@ class Stage1Trainer:
                     )
                 else:
                     self.saver.best_value = restored_metric
-                    if self.logger:
-                        self.logger.info(
-                            "checkpoint_best_restored",
-                            metric=self.config.best_metric,
-                            value=restored_metric,
-                        )
+                    self.logger.info(
+                        "checkpoint_best_restored",
+                        metric=self.config.best_metric,
+                        value=restored_metric,
+                    )
 
     # ------------------------------------------------------------------
-    def _fake_batch(self, batch_size: int) -> Dict[str, torch.Tensor]:
-        seq_len = self.config.seq_len
-        vocab = self.model_config.vocab_size
-        input_ids = torch.randint(0, vocab, (batch_size, seq_len), device=self.device)
-        attention_mask = torch.ones_like(input_ids, device=self.device)
+    def _encode_sample(self, sample: dict) -> Optional[Dict[str, torch.Tensor]]:
+        text = sample.get("text")
+        if not text:
+            return None
+        encoded = self.tokenizer(
+            text,
+            max_length=self.config.block_size,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        input_ids = encoded["input_ids"][0]
+        attention_mask = encoded["attention_mask"][0]
         labels = input_ids.clone()
-        if self.sample_iterator:
+        labels[attention_mask == 0] = -100
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+    def _next_batch(self, batch_size: int) -> Dict[str, torch.Tensor]:
+        input_ids = []
+        attention_masks = []
+        labels = []
+        while len(input_ids) < batch_size:
             sample = next(self.sample_iterator)
-            key = f"{sample['source']}::{sample['type']}"
+            encoded = self._encode_sample(sample)
+            if encoded is None:
+                continue
+            source = str(sample.get("source", sample.get("dataset", "unknown")))
+            kind = str(sample.get("kind", sample.get("type", "lm")))
+            key = f"{source}::{kind}"
             if key not in self._logged_sources:
-                self.logger.info("batch_source", source=sample["source"], type=sample["type"])
+                self.logger.info("dataset_source", source=source, kind=kind)
                 self._logged_sources.add(key)
-            if self.tool_injector and sample["type"].endswith("tool"):
-                calls = []
-                if self.config.calculator_enabled:
-                    calls.append('CALL calculator:"1+1"')
-                if self.config.scratchpad_enabled:
-                    calls.append('CALL scratchpad:"noted"')
-                if calls:
-                    _ = self.tool_injector.inject(calls)
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+            input_ids.append(encoded["input_ids"])
+            attention_masks.append(encoded["attention_mask"])
+            labels.append(encoded["labels"])
+        batch = {
+            "input_ids": torch.stack(input_ids).to(self.device),
+            "attention_mask": torch.stack(attention_masks).to(self.device),
+            "labels": torch.stack(labels).to(self.device),
+        }
+        return batch
 
     def _eval(self) -> Dict[str, float]:
         self.model.eval()
         aggregator = MetricAggregator()
         with torch.no_grad():
-            batch = self._fake_batch(self.config.eval_batch_size)
-            inputs = batch["input_ids"].to(self.device)
-            attn = batch["attention_mask"].to(self.device)
-            logits = self.model(inputs, attention_mask=attn)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), batch["labels"].view(-1), ignore_index=-100)
+            batch = self._next_batch(self.config.eval_batch_size)
+            logits = self.model(batch["input_ids"], attention_mask=batch["attention_mask"])
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                batch["labels"].view(-1),
+                ignore_index=-100,
+            )
             teacher_logits = logits.detach()
             if self.teacher is not None:
-                teacher_logits = self.teacher.logits(inputs, attention_mask=attn)
+                teacher_logits = self.teacher.logits(batch["input_ids"], attention_mask=batch["attention_mask"])
             metrics = self.distillation(self.state.step, logits, teacher_logits, batch["labels"])
-
-            math_total = 0
-            math_correct = 0
-            tool_calls = 0
-            tool_total = 0
-            if self.tool_injector and self.config.calculator_enabled:
-                tool_total = 1
-                self.tool_injector.scratchpad.reset()
-                trace = self.tool_injector.inject(['CALL calculator:"2+2"'])
-                tool_calls = 1
-                math_total = 1
-                math_correct = 1 if any("RESULT:4" in t for t in trace) else 0
-
             aggregator.update(
                 loss=float(loss.item()),
-                tokens=int(attn.sum().item()),
+                tokens=int(batch["attention_mask"].sum().item()),
                 kd_kl=float(metrics["kd_loss"].item()),
-                math_correct=math_correct,
-                math_total=math_total,
-                tool_calls=tool_calls,
-                tool_total=tool_total,
                 grad_norm=self.last_grad_norm,
                 tokens_per_sec=self.last_tokens_per_sec,
                 gpu_mem_reserved=self.last_gpu_mem,
@@ -330,23 +372,36 @@ class Stage1Trainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         start_step = self.state.step
-        for step in range(start_step + 1, self.config.max_steps + 1):
+        autocast_enabled = self.device.type == "cuda" and self.dtype in {torch.float16, torch.bfloat16}
+        autocast_dtype = self.dtype if autocast_enabled else torch.float32
+
+        for step in range(start_step + 1, self.config.train_steps + 1):
             self.state.step = step
-            batch = self._fake_batch(self.config.batch_size)
+            batch = self._next_batch(self.config.batch_size)
+            tokens_in_batch = int(batch["attention_mask"].sum().item())
+            self._tokens_since_log += tokens_in_batch
 
             try:
-                with torch.cuda.amp.autocast(enabled=self.dtype == torch.bfloat16):
+                with torch.autocast(
+                    device_type=self.device.type,
+                    dtype=autocast_dtype,
+                    enabled=autocast_enabled,
+                ):
                     logits = self.model(batch["input_ids"], attention_mask=batch["attention_mask"])
                     teacher_logits = logits.detach()
                     if self.teacher is not None:
                         teacher_logits = self.teacher.logits(
                             batch["input_ids"], attention_mask=batch["attention_mask"]
                         )
-                    old_logits = self.old_logit_reference
-                    distil = self.distillation(step, logits, teacher_logits, batch["labels"], old_logits=old_logits)
+                    distil = self.distillation(
+                        step,
+                        logits,
+                        teacher_logits,
+                        batch["labels"],
+                    )
                     total_loss = distil["total_loss"]
                     loss = total_loss / grad_accum
-                self.health.check_loss(loss.detach())
+                self.health.check_loss(total_loss.detach())
                 loss.backward()
             except RuntimeError as err:
                 if "out of memory" in str(err).lower():
@@ -367,8 +422,7 @@ class Stage1Trainer:
             if step % self.config.log_every == 0:
                 now = time.time()
                 elapsed = now - self._last_log_time
-                tokens = self.config.batch_size * self.config.seq_len * self.config.log_every
-                tokens_per_sec, mem = self.health.report_throughput(tokens, elapsed, step)
+                tokens_per_sec, mem = self.health.report_throughput(self._tokens_since_log, elapsed, step)
                 self.last_tokens_per_sec = tokens_per_sec
                 self.last_gpu_mem = mem
                 self.logger.info(
@@ -376,24 +430,22 @@ class Stage1Trainer:
                     step=step,
                     loss=float(total_loss.detach().item()),
                     lr=float(self.optimizer.param_groups[0]["lr"]),
-                    tokens_per_sec=tokens_per_sec,
+                    tokens=int(self._tokens_since_log),
                 )
                 self._last_log_time = now
+                self._tokens_since_log = 0
 
             if step % self.config.eval_every == 0:
                 metrics = self._eval()
                 self.logger.metric(step, metrics)
                 if self.config.use_checkpoint_saver:
-                    freeze_mask = {
-                        f"blocks.{i}": isinstance(block, ClassicBlock) for i, block in enumerate(self.model.blocks)
-                    }
                     self.saver.save(
                         self.model,
                         self.optimizer,
                         self.scheduler.state_dict(),
                         step,
                         metrics,
-                        freeze_mask=freeze_mask,
+                        freeze_mask=None,
                         config=config_to_dict(self.config),
                     )
 

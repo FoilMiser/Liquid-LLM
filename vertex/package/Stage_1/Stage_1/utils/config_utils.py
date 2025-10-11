@@ -18,63 +18,56 @@ from .io import open_sharded_file
 class Stage1Config:
     """In-memory representation of Stage-1 experiment configuration."""
 
-    # Training
     resume_gcs_uri: Optional[str] = None
     output_gcs_uri: Optional[str] = None
-    teacher: str = "llama-3.1-8b"
-    teacher_id: str = "meta-llama/Meta-Llama-3.1-8B"
+    run_id: Optional[str] = None
+    teacher_name: str = "meta-llama/Meta-Llama-3.1-8B"
     teacher_endpoint: Optional[str] = None
     teacher_max_batch_size: int = 0
+    dataset_cfg: Optional[str] = None
     seq_len: int = 1024
-    net2net_width_pct: float = 10.0
-    add_blocks_classic: int = 2
-    add_blocks_liquid: int = 3
-    freeze_classic_after: bool = True
+    block_size: int = 1024
+    train_steps: int = 250_000
+    batch_size: int = 8
+    eval_batch_size: int = 8
+    throughput_tokens: int = 32_768
     use_flash_attn: bool = True
     use_grad_ckpt: bool = True
-    precision: str = "bfloat16"
+    dtype: str = "bfloat16"
+    device: str = "cuda"
     optimizer: str = "adamw"
     lr: float = 2.5e-4
     weight_decay: float = 0.1
     betas: str = "0.9,0.95"
     warmup_steps: int = 3000
-    max_steps: int = 120_000
     eval_every: int = 1000
     save_every: int = 2000
+    log_every: int = 100
+    max_grad_norm: float = 1.0
+    gradient_accumulation_steps: int = 1
+    hf_secret_name: Optional[str] = "hf_token"
+    hf_cache_dir: Optional[str] = None
+    seed: int = 42
+    tokenizer_name: Optional[str] = None
+    d_model: int = 768
+    n_heads: int = 12
+    n_layers: int = 15
+    dropout: float = 0.0
+    layer_norm_eps: float = 1e-5
     kd_temperature: float = 2.0
     kd_alpha_start: float = 0.7
     kd_alpha_end: float = 0.4
     kd_anneal_pct: float = 0.3
     keep_old_logit_l2: float = 0.1
     keep_old_logit_l2_fade_step: int = 30_000
-    dataset_cfg: Optional[str] = None
+    keep_old_logit_l2_enable: bool = True
     tool_use_ratio: float = 0.08
     calculator_enabled: bool = True
     scratchpad_enabled: bool = True
-    hf_secret_name: Optional[str] = "hf_token"
-
-    # Execution settings
-    run_id: Optional[str] = None
-    seed: int = 42
-    log_every: int = 100
-    device: str = "cuda"
-    bf16: bool = True
-    local_rank: int = 0
-    world_size: int = 1
-
-    # Scheduler
-    schedule: str = "warmup_cosine"
-
-    # Checkpointing
+    use_checkpoint_saver: bool = True
     best_metric: str = "val_perplexity"
     best_metric_mode: str = "min"
-
-    # Additional knobs
-    do_surgery: bool = False
-    keep_old_logit_l2_enable: bool = True
-    use_ddp: bool = False
-    use_checkpoint_saver: bool = True
-
+    num_workers: int = 4
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -132,61 +125,62 @@ def parse_kv_overrides(overrides: Iterable[str]) -> Dict[str, Any]:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stage-1 training entrypoint")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config")
-    parser.add_argument("--config_override", type=str, nargs="*", default=None,
-                        help="Additional KEY=VALUE overrides")
+    parser.add_argument(
+        "--config_override",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Additional KEY=VALUE overrides",
+    )
     parser.add_argument("--resume_gcs_uri", type=str, required=False)
     parser.add_argument("--output_gcs_uri", type=str, required=False)
-    parser.add_argument("--teacher", type=str, default="llama-3.1-8b")
-    parser.add_argument("--teacher_id", type=str, default="meta-llama/Meta-Llama-3.1-8B")
+    parser.add_argument("--run_id", type=str, default=None)
+    parser.add_argument("--teacher_name", type=str, default="meta-llama/Meta-Llama-3.1-8B")
     parser.add_argument("--teacher_endpoint", type=str, default=None)
     parser.add_argument("--teacher_max_batch_size", type=int, default=0)
+    parser.add_argument("--dataset_cfg", type=str, default=None)
     parser.add_argument("--seq_len", type=int, default=1024)
-    parser.add_argument("--net2net_width_pct", type=float, default=10.0)
-    parser.add_argument("--add_blocks_classic", type=int, default=2)
-    parser.add_argument("--add_blocks_liquid", type=int, default=3)
-    parser.add_argument("--freeze_classic_after", type=_coerce_bool, default=True)
+    parser.add_argument("--block_size", type=int, default=1024)
+    parser.add_argument("--train_steps", type=int, default=250_000)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--eval_batch_size", type=int, default=8)
+    parser.add_argument("--throughput_tokens", type=int, default=32_768)
     parser.add_argument("--use_flash_attn", type=_coerce_bool, default=True)
     parser.add_argument("--use_grad_ckpt", type=_coerce_bool, default=True)
-    parser.add_argument("--precision", type=str, default="bfloat16")
+    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--optimizer", type=str, default="adamw")
     parser.add_argument("--lr", type=float, default=2.5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--betas", type=str, default="0.9,0.95")
     parser.add_argument("--warmup_steps", type=int, default=3000)
-    parser.add_argument("--max_steps", type=int, default=120_000)
     parser.add_argument("--eval_every", type=int, default=1000)
     parser.add_argument("--save_every", type=int, default=2000)
+    parser.add_argument("--log_every", type=int, default=100)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--hf_secret_name", type=str, default="hf_token")
+    parser.add_argument("--hf_cache_dir", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--tokenizer_name", type=str, default=None)
+    parser.add_argument("--d_model", type=int, default=768)
+    parser.add_argument("--n_heads", type=int, default=12)
+    parser.add_argument("--n_layers", type=int, default=15)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--layer_norm_eps", type=float, default=1e-5)
     parser.add_argument("--kd_temperature", type=float, default=2.0)
     parser.add_argument("--kd_alpha_start", type=float, default=0.7)
     parser.add_argument("--kd_alpha_end", type=float, default=0.4)
     parser.add_argument("--kd_anneal_pct", type=float, default=0.3)
     parser.add_argument("--keep_old_logit_l2", type=float, default=0.1)
     parser.add_argument("--keep_old_logit_l2_fade_step", type=int, default=30_000)
-    parser.add_argument("--dataset_cfg", type=str, default=None)
+    parser.add_argument("--keep_old_logit_l2_enable", type=_coerce_bool, default=True)
     parser.add_argument("--tool_use_ratio", type=float, default=0.08)
     parser.add_argument("--calculator_enabled", type=_coerce_bool, default=True)
     parser.add_argument("--scratchpad_enabled", type=_coerce_bool, default=True)
-    parser.add_argument("--hf_secret_name", type=str, default="hf_token")
-    parser.add_argument("--run_id", type=str, default=None)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--log_every", type=int, default=100)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--bf16", type=_coerce_bool, default=True)
-    parser.add_argument("--local_rank", type=int, default=0)
-    parser.add_argument("--world_size", type=int, default=1)
-    parser.add_argument("--schedule", type=str, default="warmup_cosine")
+    parser.add_argument("--use_checkpoint_saver", type=_coerce_bool, default=True)
     parser.add_argument("--best_metric", type=str, default="val_perplexity")
     parser.add_argument("--best_metric_mode", type=str, default="min")
-    parser.add_argument("--do_surgery", type=_coerce_bool, default=False)
-    parser.add_argument("--keep_old_logit_l2_enable", type=_coerce_bool, default=True)
-    parser.add_argument("--use_ddp", type=_coerce_bool, default=False)
-    parser.add_argument("--use_checkpoint_saver", type=_coerce_bool, default=True)
-    parser.add_argument("--use_old_logit_reference", type=str, default=None)
-    parser.add_argument("--hf_cache_dir", type=str, default=None)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--eval_batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     return parser
 
@@ -213,6 +207,9 @@ def build_config(args: argparse.Namespace) -> Stage1Config:
     for key in extra_keys:
         extra[key] = cfg_dict.pop(key)
     cfg = Stage1Config(**cfg_dict)
+    if not cfg.tokenizer_name:
+        cfg.tokenizer_name = cfg.teacher_name
+    cfg.dtype = str(cfg.dtype).lower()
     cfg.extra = extra
     return cfg
 
