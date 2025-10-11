@@ -7,6 +7,7 @@ from .config_utils import (
     config_to_dict,
     ensure_output_path,
     dump_config,
+    DEFAULT_DATASET_CFG,
 )
 from .schedule import WarmupCosineScheduler
 from .io import open_sharded_file, path_exists, resolve_glob_paths, write_jsonl
@@ -20,6 +21,7 @@ __all__ = [
     "config_to_dict",
     "ensure_output_path",
     "dump_config",
+    "DEFAULT_DATASET_CFG",
     "WarmupCosineScheduler",
     "open_sharded_file",
     "write_jsonl",

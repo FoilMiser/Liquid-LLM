@@ -445,7 +445,6 @@ class Stage1Trainer:
                         self.scheduler.state_dict(),
                         step,
                         metrics,
-                        freeze_mask=None,
                         config=config_to_dict(self.config),
                     )
 
