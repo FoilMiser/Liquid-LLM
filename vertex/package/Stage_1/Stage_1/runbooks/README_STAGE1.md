@@ -7,15 +7,18 @@ Recommended Vertex AI Custom Training configuration:
   - Accelerator: `NVIDIA_L4` (count=1)
   - Container: `us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest`
   - Local package path: `vertex/package/Stage_1`
-  - Python module: `Stage_1.launcher`
+  - Python module: `Stage_1.cli`
 
 Populate the Vertex console form as follows:
 
 | Field | Value |
 | ----- | ----- |
-| Python module | `Stage_1.launcher` |
+| Python module | `Stage_1.cli` |
 | Command line arguments | Paste the block below |
 | Output directory | `gs://liquid-llm-bucket-2/stage1/checkpoints/vertex_runs` |
+
+Avoid adding `pip install` commands to the "Arguments" field; the package's
+dependencies are resolved from `pyproject.toml`.
 
 The CLI validates the resume checkpoint, teacher model selection, and dataset
 manifest before launching training. It also generates a UTC `run_id` and
@@ -33,7 +36,7 @@ necessary.
 --batch_size=8
 --throughput_tokens=32768
 --use_flash_attn=true
---fa_wheel_gcs_uri=gs://YOUR_BUCKET/wheels/flash_attn-2.5.8-cp310-cp310-manylinux2014_x86_64.whl
+--fa_wheel_gcs_uri=gs://liquid-llm-bucket-2/FlashAttention/flash_attn-2.8.3+cu12torch2.4cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
 --use_grad_ckpt=true
 --dtype=bfloat16
 --device=cuda
@@ -42,12 +45,10 @@ necessary.
 
 ## FlashAttention wheel handling
 
-The `Stage_1.launcher` module consumes the FlashAttention wheel flags before
-delegating to the training CLI. You can provide either
-`--fa_wheel_gcs_uri=gs://...` or `--fa_wheel_url=https://...` when launching the
-job. The launcher will attempt to download and install the wheel and strip those
-flags from the arguments passed to `Stage_1.cli`, preventing "unrecognized
-arguments" errors.
+The `Stage_1.cli` module handles FlashAttention wheel flags directly. Provide
+`--fa_wheel_gcs_uri=gs://...` when launching the job to download and install the
+wheel before training begins. The CLI strips these flags from the trainer's
+configuration to avoid "unrecognized arguments" errors.
 
 Environment variables offer the same functionality when CLI flags are
 inconvenient:

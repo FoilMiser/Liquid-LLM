@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import logging
 import os
 import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
 from typing import Sequence
+
+import pkg_resources
 
 from Stage_1.logging_utils import get_logger
 from Stage_1.utils import (
@@ -28,6 +32,39 @@ _TOKEN_ENV_VARS = (
     "HF_API_TOKEN",
     "HUGGINGFACEHUB_API_TOKEN",
 )
+
+
+def _log_dependency_versions() -> None:
+    for name in ["datasets", "fsspec", "gcsfs"]:
+        try:
+            importlib.import_module(name)
+            version = pkg_resources.get_distribution(name).version
+            logging.info("Resolved %s==%s", name, version)
+        except Exception as exc:  # pragma: no cover - best effort logging
+            logging.warning("Could not resolve %s version: %s", name, exc)
+
+
+def _validate_dependency_stack() -> None:
+    try:
+        datasets_version = pkg_resources.get_distribution("datasets").version
+    except Exception:
+        return
+
+    if datasets_version != "2.20.0":
+        return
+
+    try:
+        fsspec_version = pkg_resources.get_distribution("fsspec").version
+    except Exception as exc:
+        raise EntrypointError(
+            "datasets==2.20.0 requires fsspec<=2024.5.0; ensure the worker image provides fsspec==2024.5.0."
+        ) from exc
+
+    if pkg_resources.parse_version(fsspec_version) > pkg_resources.parse_version("2024.5.0"):
+        raise EntrypointError(
+            "Incompatible dependency stack detected: datasets==2.20.0 expects fsspec<=2024.5.0, but fsspec=="
+            f"{fsspec_version} was resolved. Update the environment to use fsspec==2024.5.0 or adjust the dataset version before training."
+        )
 
 
 class EntrypointError(Exception):
@@ -169,7 +206,7 @@ def _download_flash_attention_wheel(gcs_uri: str) -> str:
 def _install_flash_attention(wheel_uri: str) -> bool:
     try:
         wheel_path = _download_flash_attention_wheel(wheel_uri)
-        subprocess.run([sys.executable, "-m", "pip", "install", wheel_path], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", wheel_path], check=True)
         _LOGGER.info("flash_attention_install", extra={"status": "success", "wheel": wheel_uri})
         return True
     except FlashAttentionError:
@@ -246,6 +283,9 @@ def _run_training(config) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    _log_dependency_versions()
+    _validate_dependency_stack()
 
     parser = _build_parser()
     try:

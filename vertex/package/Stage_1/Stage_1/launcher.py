@@ -13,7 +13,10 @@ USE_FA_FLAG = "--use_flash_attn"
 
 def _pip_install(path: str) -> None:
     try:
-        subprocess.run([sys.executable, "-m", "pip", "install", path, "--no-deps"], check=False)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", path, "--no-deps"],
+            check=False,
+        )
         print(f"[launcher] Pip install attempted (non-fatal): {path}")
     except Exception as e:
         print(f"[launcher] Pip install failed non-fatally: {e}")
