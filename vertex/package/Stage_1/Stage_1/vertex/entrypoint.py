@@ -12,6 +12,8 @@ from typing import List, Sequence
 from Stage_1.cli import main as stage1_main
 from Stage_1.utils import get_hf_token
 
+_LOG_PREFIX = "[Stage_1.vertex.entrypoint]"
+
 _TOKEN_ENV_VARS = ("HF_TOKEN", "HF_API_TOKEN", "HUGGINGFACEHUB_API_TOKEN")
 
 
@@ -108,12 +110,12 @@ def _ensure_hf_token(secret_name: str | None, explicit: str | None, project_hint
             token = get_hf_token(secret_name, project_id=project_hint)
         except ValueError as exc:
             print(
-                f"[trainer.entrypoint] WARNING: unable to resolve secret '{secret_name}': {exc}",
+                f"{_LOG_PREFIX} WARNING: unable to resolve secret '{secret_name}': {exc}",
                 file=sys.stderr,
             )
         except Exception as exc:  # pragma: no cover - networking errors
             print(
-                f"[trainer.entrypoint] WARNING: failed to fetch secret '{secret_name}': {exc}",
+                f"{_LOG_PREFIX} WARNING: failed to fetch secret '{secret_name}': {exc}",
                 file=sys.stderr,
             )
     if not token:
@@ -125,7 +127,7 @@ def _ensure_hf_token(secret_name: str | None, explicit: str | None, project_hint
 def _maybe_warn_unused(label: str, value: object | None) -> None:
     if value is None:
         return
-    print(f"[trainer.entrypoint] NOTE: ignoring argument --{label}", file=sys.stderr)
+    print(f"{_LOG_PREFIX} NOTE: ignoring argument --{label}", file=sys.stderr)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -188,7 +190,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     stage1_args.extend(extras)
 
     cmd = " ".join(shlex.quote(arg) for arg in stage1_args)
-    print(f"[trainer.entrypoint] Launching Stage-1 CLI with arguments: {cmd}")
+    print(f"{_LOG_PREFIX} Launching Stage-1 CLI with arguments: {cmd}")
     stage1_main(stage1_args)
 
 
