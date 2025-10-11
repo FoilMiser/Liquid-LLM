@@ -1,5 +1,4 @@
 """Stage-1 model definition and checkpoint utilities."""
-
 from __future__ import annotations
 
 import io
@@ -13,6 +12,7 @@ from torch.utils import checkpoint as checkpoint_utils
 from ..utils.io import open_sharded_file
 from .blocks import LiquidBlock
 from .config import ModelConfig
+from .attention import pick_attention_backend
 
 
 @dataclass
@@ -77,15 +77,19 @@ class Stage1Model(nn.Module):
 
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
+
+                def _forward_block(tensor, blk=block, mask=key_padding_mask):
+                    with pick_attention_backend(self.config.use_flash_attn):
+                        return blk(tensor, key_padding_mask=mask)
+
                 hidden_states = checkpoint_utils.checkpoint(  # type: ignore[arg-type]
-                    lambda tensor, blk=block, mask=key_padding_mask: blk(
-                        tensor, key_padding_mask=mask
-                    ),
+                    _forward_block,
                     hidden_states,
                     use_reentrant=False,
                 )
             else:
-                hidden_states = block(hidden_states, key_padding_mask=key_padding_mask)
+                with pick_attention_backend(self.config.use_flash_attn):
+                    hidden_states = block(hidden_states, key_padding_mask=key_padding_mask)
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
