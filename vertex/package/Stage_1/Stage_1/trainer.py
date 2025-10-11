@@ -19,6 +19,7 @@ from .data import DataMixer, load_manifest
 from .distillation import DistillationConfig, DistillationLoss, TeacherConfig, TeacherModel
 from .monitoring import HealthMonitor, MetricAggregator, StructuredLogger
 from .models import ModelConfig, Stage1Model, load_stage1_checkpoint
+from .models.attention import HAVE_FA
 from .utils import WarmupCosineScheduler, config_to_dict, ensure_output_path, get_hf_token
 
 
@@ -165,14 +166,18 @@ class Stage1Trainer:
         return torch.float32
 
     def _configure_sdp(self) -> None:
-        try:
-            torch.backends.cuda.sdp_kernel(  # type: ignore[attr-defined]
-                enable_flash=self.config.use_flash_attn,
-                enable_math=not self.config.use_flash_attn,
-                enable_mem_efficient=not self.config.use_flash_attn,
-            )
-        except Exception:  # pragma: no cover - defensive, kernels vary by runtime
-            pass
+        backend = "flash_attn" if self.config.use_flash_attn and HAVE_FA else "sdpa"
+        reason = None
+        if self.config.use_flash_attn and not HAVE_FA:
+            reason = "flash_attn_not_available"
+        elif not self.config.use_flash_attn:
+            reason = "disabled_via_flag"
+
+        log_kwargs = {"backend": backend}
+        if reason:
+            log_kwargs["reason"] = reason
+
+        self.logger.info("attention_backend", **log_kwargs)
 
     def _load_tokenizer(self, tokenizer_name: str, hf_token: Optional[str]):
         auth_kwargs: Dict[str, object] = {}
