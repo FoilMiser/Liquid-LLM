@@ -24,9 +24,20 @@ dependencies = [
     "python-json-logger>=3.2.1",
 ]
 
-[tool.setuptools.packages.find]
-where = ["Stage_1"]
-include = ["Stage_1*", "trainer*"]
+[tool.setuptools]
+package-dir = {"" = "Stage_1"}
+packages = {find = {where = ["."], include = ["Stage_1*", "trainer*"]}}
+include-package-data = true
+
+[tool.setuptools.package-data]
+"Stage_1" = [
+    "configs/*.yaml",
+    "configs/*.jsonl",
+    "runbooks/*.txt",
+    "monitoring/*.yaml",
+    "monitoring/*.json",
+    "data/**/*.json",
+]
 
 [project.scripts]
 stage1-train = "Stage_1.cli:main"
