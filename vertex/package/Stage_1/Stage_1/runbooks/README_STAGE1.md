@@ -17,6 +17,11 @@ Populate the Vertex console form as follows:
 | Command line arguments | Paste the block below |
 | Output directory | `gs://liquid-llm-bucket-2/stage1/checkpoints/vertex_runs` |
 
+The CLI validates the resume checkpoint, teacher model selection, and dataset
+manifest before launching training. It also generates a UTC `run_id` and
+appends it to the output path automatically, so no shell `$(date ...)` logic is
+necessary.
+
 ```
 --resume_gcs_uri=gs://liquid-llm-bucket-2/stage1/stage1.pt
 --output_gcs_uri=gs://liquid-llm-bucket-2/stage1/checkpoints/vertex_runs
@@ -34,4 +39,5 @@ Populate the Vertex console form as follows:
 --hf_secret_name=hf_token
 ```
 
-If you encounter OOMs or throughput is insufficient, upgrade to `a2-highgpu-1g` with an `NVIDIA_A100_40GB` accelerator using the same arguments.
+If you encounter OOMs or throughput is insufficient, upgrade to `a2-highgpu-1g`
+with an `NVIDIA_A100_40GB` accelerator using the same arguments.

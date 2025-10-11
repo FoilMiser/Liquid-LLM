@@ -30,7 +30,15 @@ class BestCheckpointSaver:
             return value < self.best_value
         return value > self.best_value
 
-    def save(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer, scheduler_state: dict, step: int, metrics: dict, freeze_mask: dict | None = None, config: dict | None = None) -> None:
+    def save(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler_state: dict,
+        step: int,
+        metrics: dict,
+        config: dict | None = None,
+    ) -> None:
         value = metrics.get(self.metric)
         if value is None:
             return
@@ -50,10 +58,6 @@ class BestCheckpointSaver:
                 torch.save(state, fh)
         else:
             torch.save(state, ckpt_path)
-        if freeze_mask is not None:
-            mask_path = os.path.join(self.output_path, "freeze_mask.json")
-            with open_sharded_file(mask_path, "w") as f:
-                json.dump(freeze_mask, f, indent=2, sort_keys=True)
         if config is not None:
             config_path = os.path.join(self.output_path, "config_stage1.json")
             with open_sharded_file(config_path, "w") as f:

@@ -14,6 +14,9 @@ import yaml
 from .io import open_sharded_file
 
 
+DEFAULT_DATASET_CFG = "gs://liquid-llm-bucket-2/datasets/stage1.jsonl"
+
+
 @dataclass
 class Stage1Config:
     """In-memory representation of Stage-1 experiment configuration."""
@@ -24,7 +27,7 @@ class Stage1Config:
     teacher_name: str = "meta-llama/Meta-Llama-3.1-8B"
     teacher_endpoint: Optional[str] = None
     teacher_max_batch_size: int = 0
-    dataset_cfg: Optional[str] = None
+    dataset_cfg: Optional[str] = DEFAULT_DATASET_CFG
     seq_len: int = 1024
     block_size: int = 1024
     train_steps: int = 250_000
@@ -138,7 +141,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher_name", type=str, default="meta-llama/Meta-Llama-3.1-8B")
     parser.add_argument("--teacher_endpoint", type=str, default=None)
     parser.add_argument("--teacher_max_batch_size", type=int, default=0)
-    parser.add_argument("--dataset_cfg", type=str, default=None)
+    parser.add_argument("--dataset_cfg", type=str, default=DEFAULT_DATASET_CFG)
     parser.add_argument("--seq_len", type=int, default=1024)
     parser.add_argument("--block_size", type=int, default=1024)
     parser.add_argument("--train_steps", type=int, default=250_000)
@@ -237,4 +240,5 @@ __all__ = [
     "config_to_dict",
     "ensure_output_path",
     "dump_config",
+    "DEFAULT_DATASET_CFG",
 ]
