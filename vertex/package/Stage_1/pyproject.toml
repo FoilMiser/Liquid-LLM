@@ -1,36 +1,41 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "Stage-1"
 version = "0.1.0"
-description = "Stage-1 Vertex AI training package for Liquid LLM"
 requires-python = ">=3.10"
 dependencies = [
-    "transformers==4.57.0",
-    "tokenizers==0.22.1",
-    "datasets==2.20.0",
-    "pyarrow==16.1.0",
-    "huggingface_hub==0.35.3",
-    "accelerate==1.10.1",
-    "google-cloud-secret-manager==2.24.0",
-    "google-cloud-storage==2.18.2",
-    "einops==0.8.0",
-    "numpy==1.26.4",
-    "safetensors==0.6.2",
-    "sentencepiece==0.2.1",
-    "tqdm==4.66.4",
-    "pyyaml==6.0.2",
+  "torch>=2.4.0,<2.5.0",
+  "transformers==4.57.0",
+  "accelerate==1.10.1",
+  "datasets==2.20.0",
+  "sentencepiece>=0.2.0",
+  "safetensors>=0.6.2",
+  "einops>=0.8.0",
+  "google-cloud-storage==2.18.2",
+  "google-cloud-secret-manager==2.24.0",
+  "python-json-logger>=2.0.7",
+  "gcsfs==2025.5.1",
+  "fsspec==2025.5.1",
+  "huggingface_hub>=0.23.2",
+  "numpy>=1.26.4",
+  "pyyaml>=6.0.2",
+  "pyarrow>=16.1.0",
+  "tokenizers>=0.22.1",
+  "tqdm>=4.66.4",
 ]
+
+authors = []
 
 [tool.setuptools]
 package-dir = {"" = "Stage_1"}
-# All implementation now lives under the `Stage_1` namespace. A dynamic module
-# alias inside ``Stage_1.__init__`` keeps ``python -m trainer.entrypoint``
-# working for legacy job definitions without shipping a separate package.
-packages = {find = {where = ["Stage_1"], include = ["Stage_1*", "trainer*"]}}
 include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["Stage_1"]
+include = ["Stage_1*", "trainer*"]
 
 [tool.setuptools.package-data]
 "Stage_1" = [

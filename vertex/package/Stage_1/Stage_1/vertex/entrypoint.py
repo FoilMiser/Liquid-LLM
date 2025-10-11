@@ -1,95 +1,70 @@
-"""Vertex AI entrypoint that adapts Stage-1 configuration to Vertex arguments."""
+"""Vertex AI entrypoint for Stage-1 training."""
 
 from __future__ import annotations
 
 import argparse
 import os
-import shlex
+import subprocess
 import sys
-import uuid
-from typing import List, Sequence
+import tempfile
+from datetime import datetime, timezone
+from typing import Sequence
 
-from Stage_1.cli import main as stage1_main
-from Stage_1.utils import get_hf_token
+from Stage_1.logging_utils import get_logger
+from Stage_1.utils import (
+    DEFAULT_DATASET_CFG,
+    build_arg_parser,
+    build_config,
+    dump_config,
+    ensure_output_path,
+    get_hf_token,
+    path_exists,
+)
 
-_LOG_PREFIX = "[Stage_1.vertex.entrypoint]"
-
-_TOKEN_ENV_VARS = ("HF_TOKEN", "HF_API_TOKEN", "HUGGINGFACEHUB_API_TOKEN")
-
-
-def _parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[str]]:
-    parser = argparse.ArgumentParser(
-        description="Stage-1 Vertex AI adapter",
-        add_help=True,
-    )
-    parser.add_argument("--resume_gcs_uri", type=str, default=None)
-    parser.add_argument("--output_gcs_uri", type=str, default=None)
-    parser.add_argument("--teacher_name", type=str, default=None)
-    parser.add_argument("--teacher_endpoint", type=str, default=None)
-    parser.add_argument("--teacher_max_batch_size", type=int, default=None)
-    parser.add_argument("--dataset_name", type=str, default=None)
-    parser.add_argument("--dataset_config", type=str, default=None)
-    parser.add_argument("--dataset_cfg", type=str, default=None)
-    parser.add_argument("--block_size", type=int, default=None)
-    parser.add_argument("--train_steps", type=int, default=None)
-    parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--eval_every", type=int, default=None)
-    parser.add_argument("--save_every", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--weight_decay", type=float, default=None)
-    parser.add_argument("--betas", type=str, default=None)
-    parser.add_argument("--warmup_steps", type=int, default=None)
-    parser.add_argument("--throughput_tokens", type=int, default=None)
-    parser.add_argument("--dtype", type=str, default=None)
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--hf_secret_name", type=str, default=None)
-    parser.add_argument("--hf_secret_project", type=str, default=None)
-    parser.add_argument("--hf_token_value", type=str, default=None)
-    parser.add_argument("--hf_cache_dir", type=str, default=None)
-    parser.add_argument("--run_id", type=str, default=None)
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--log_every", type=int, default=None)
-    parser.add_argument("--num_workers", type=int, default=None)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
-    parser.add_argument("--max_grad_norm", type=float, default=None)
-    known, extras = parser.parse_known_args(argv)
-    return known, extras
+_LOGGER = get_logger("vertex.entrypoint")
+_CANONICAL_TEACHER = "meta-llama/Meta-Llama-3.1-8B"
+_TOKEN_ENV_VARS = (
+    "HF_TOKEN",
+    "HF_API_TOKEN",
+    "HUGGINGFACEHUB_API_TOKEN",
+)
 
 
-def _append_flag(args: List[str], name: str, value: object | None) -> None:
-    if value is None:
-        return
+class EntrypointError(Exception):
+    """Base error for entrypoint failures."""
+
+
+class UserInputError(EntrypointError):
+    """Raised for recoverable user input issues."""
+
+
+class FlashAttentionError(EntrypointError):
+    """Raised when FlashAttention setup fails."""
+
+
+def _bool_flag(value: str | bool | None) -> bool:
     if isinstance(value, bool):
-        literal = "true" if value else "false"
-    else:
-        literal = str(value)
-    args.append(f"--{name}={literal}")
+        return value
+    if value is None:
+        return False
+    return str(value).lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _teacher_alias(model_id: str | None) -> str | None:
-    if not model_id:
-        return None
-    lowered = model_id.lower()
-    if "meta-llama-3.1-8b-instruct" in lowered:
-        return "llama-3.1-8b-instruct"
-    if "meta-llama-3.1-8b" in lowered:
-        return "llama-3.1-8b"
-    return None
+def _build_parser() -> argparse.ArgumentParser:
+    parser = build_arg_parser()
+    if "fa_wheel_gcs_uri" not in {action.dest for action in parser._actions}:  # type: ignore[attr-defined]
+        parser.add_argument("--fa_wheel_gcs_uri", type=str, default=None, help="GCS URI to a FlashAttention wheel")
+    if "allow_fa_fallback" not in {action.dest for action in parser._actions}:  # type: ignore[attr-defined]
+        parser.add_argument(
+            "--allow_fa_fallback",
+            type=_bool_flag,
+            default=False,
+            help="Continue without FlashAttention if installation fails",
+        )
+    return parser
 
 
-def _resolve_output_uri(cli_output: str | None) -> str | None:
-    if cli_output:
-        return cli_output
-    for env_key in ("AIP_CHECKPOINT_DIR", "AIP_MODEL_DIR", "AIP_OUTPUT_DIR"):
-        value = os.getenv(env_key)
-        if value:
-            return value
-    return None
-
-
-def _resolve_project_hint(cli_value: str | None) -> str | None:
-    if cli_value:
-        return cli_value
+def _detect_project_id() -> str | None:
     for env_key in (
         "AIP_PROJECT_ID",
         "GOOGLE_CLOUD_PROJECT",
@@ -103,96 +78,220 @@ def _resolve_project_hint(cli_value: str | None) -> str | None:
     return None
 
 
-def _ensure_hf_token(secret_name: str | None, explicit: str | None, project_hint: str | None) -> None:
-    token = explicit
-    if token is None and secret_name:
-        try:
-            token = get_hf_token(secret_name, project_id=project_hint)
-        except ValueError as exc:
-            print(
-                f"{_LOG_PREFIX} WARNING: unable to resolve secret '{secret_name}': {exc}",
-                file=sys.stderr,
-            )
-        except Exception as exc:  # pragma: no cover - networking errors
-            print(
-                f"{_LOG_PREFIX} WARNING: failed to fetch secret '{secret_name}': {exc}",
-                file=sys.stderr,
-            )
-    if not token:
-        return
+def _export_hf_token(token: str) -> None:
+    token = token.strip()
+    os.environ["HUGGINGFACE_HUB_TOKEN"] = token
     for env_key in _TOKEN_ENV_VARS:
         os.environ.setdefault(env_key, token)
 
 
-def _maybe_warn_unused(label: str, value: object | None) -> None:
-    if value is None:
+def _prepare_hf_token(secret_name: str | None, project_id: str | None) -> None:
+    if not secret_name:
+        token = get_hf_token(None, project_id=project_id)
+        if token:
+            _export_hf_token(token)
         return
-    print(f"{_LOG_PREFIX} NOTE: ignoring argument --{label}", file=sys.stderr)
+
+    try:
+        token = get_hf_token(secret_name, project_id=project_id)
+    except ValueError as exc:
+        raise UserInputError(f"Unable to resolve HF secret '{secret_name}': {exc}") from exc
+    if not token:
+        raise UserInputError(
+            f"Hugging Face secret '{secret_name}' was not found; ensure it exists and the training service account has access."
+        )
+    _export_hf_token(token)
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def _validate_teacher(name: str) -> None:
+    if name != _CANONICAL_TEACHER:
+        raise UserInputError(
+            "Stage-1 distillation requires --teacher_name=meta-llama/Meta-Llama-3.1-8B."
+        )
+
+    from huggingface_hub import HfApi
+    from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
+
+    token = (
+        os.getenv("HUGGINGFACE_HUB_TOKEN")
+        or os.getenv("HF_TOKEN")
+        or os.getenv("HF_API_TOKEN")
+        or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+    )
+    api = HfApi(token=token)
+    try:
+        api.model_info(name)
+    except RepositoryNotFoundError as exc:  # pragma: no cover - external dependency
+        raise UserInputError(
+            "Teacher model 'meta-llama/Meta-Llama-3.1-8B' is not available on Hugging Face Hub."
+        ) from exc
+    except HfHubHTTPError as exc:  # pragma: no cover - external dependency
+        status = getattr(exc.response, "status_code", None)
+        if status in {401, 403}:
+            raise UserInputError(
+                "Access to 'meta-llama/Meta-Llama-3.1-8B' was denied. Ensure your HF token has the required permissions."
+            ) from exc
+        raise UserInputError(
+            f"Failed to validate teacher model 'meta-llama/Meta-Llama-3.1-8B': {exc}"
+        ) from exc
+    except Exception as exc:  # pragma: no cover - defensive
+        raise UserInputError(
+            "Unable to reach Hugging Face Hub to validate the teacher model."
+        ) from exc
+
+
+def _download_flash_attention_wheel(gcs_uri: str) -> str:
+    if not gcs_uri.startswith("gs://"):
+        raise FlashAttentionError("FlashAttention wheel must be provided via a gs:// URI.")
+    try:
+        _, remainder = gcs_uri.split("gs://", 1)
+        bucket_name, blob_name = remainder.split("/", 1)
+    except ValueError as exc:
+        raise FlashAttentionError(f"Invalid FlashAttention URI '{gcs_uri}'.") from exc
+
+    try:
+        from google.cloud import storage
+    except Exception as exc:  # pragma: no cover - dependency issues
+        raise FlashAttentionError(f"google-cloud-storage is required to download {gcs_uri}: {exc}") from exc
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    if not blob.exists():
+        raise FlashAttentionError(f"FlashAttention wheel not found at {gcs_uri}.")
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(blob_name)[-1] or ".whl")
+    os.close(tmp_fd)
+    blob.download_to_filename(tmp_path)
+    return tmp_path
+
+
+def _install_flash_attention(wheel_uri: str) -> bool:
+    try:
+        wheel_path = _download_flash_attention_wheel(wheel_uri)
+        subprocess.run([sys.executable, "-m", "pip", "install", wheel_path], check=True)
+        _LOGGER.info("flash_attention_install", extra={"status": "success", "wheel": wheel_uri})
+        return True
+    except FlashAttentionError:
+        raise
+    except subprocess.CalledProcessError as exc:
+        raise FlashAttentionError(f"Pip failed to install FlashAttention wheel from {wheel_uri}: {exc}") from exc
+    except Exception as exc:  # pragma: no cover - network/filesystem failures
+        raise FlashAttentionError(f"Unexpected error installing FlashAttention wheel from {wheel_uri}: {exc}") from exc
+    finally:
+        try:
+            if "wheel_path" in locals() and os.path.exists(wheel_path):
+                os.remove(wheel_path)
+        except Exception:  # pragma: no cover - cleanup best-effort
+            pass
+
+def _prepare_flash_attention(use_flash_attn: bool, wheel_uri: str | None, allow_fallback: bool) -> bool:
+    if not use_flash_attn or not wheel_uri:
+        return use_flash_attn
+
+    try:
+        _install_flash_attention(wheel_uri)
+        return True
+    except FlashAttentionError as exc:
+        if allow_fallback:
+            _LOGGER.warning(
+                "flash_attention_fallback",
+                extra={"wheel": wheel_uri, "detail": str(exc)},
+            )
+            return False
+        raise
+
+
+def _ensure_paths(config) -> None:
+    if not config.resume_gcs_uri:
+        raise UserInputError(
+            "Stage-1 requires --resume_gcs_uri pointing to the post-surgery checkpoint (e.g. gs://liquid-llm-bucket-2/stage1/stage1.pt)."
+        )
+    if config.resume_gcs_uri.startswith("gs://") and "/" not in config.resume_gcs_uri[5:]:
+        raise UserInputError(
+            f"Checkpoint URI must include both bucket and object path: {config.resume_gcs_uri}"
+        )
+    if not path_exists(config.resume_gcs_uri):
+        raise UserInputError(f"Checkpoint not found at {config.resume_gcs_uri}")
+    if not config.dataset_cfg:
+        raise UserInputError(
+            f"Stage-1 requires --dataset_cfg pointing to a manifest JSONL (default: {DEFAULT_DATASET_CFG})."
+        )
+    if config.dataset_cfg.startswith("gs://") and "/" not in config.dataset_cfg[5:]:
+        raise UserInputError(
+            f"Dataset manifest URI must include both bucket and object path: {config.dataset_cfg}"
+        )
+    if not path_exists(config.dataset_cfg):
+        raise UserInputError(f"Dataset manifest not found at {config.dataset_cfg}")
+
+
+def _finalize_output_path(config) -> None:
+    if not config.run_id:
+        config.run_id = datetime.now(timezone.utc).strftime("stage1-%Y%m%d-%H%M%S")
+    if config.output_gcs_uri:
+        base_uri = config.output_gcs_uri.rstrip("/")
+        config.output_gcs_uri = f"{base_uri}/{config.run_id}"
+        if not config.output_gcs_uri.startswith("gs://"):
+            ensure_output_path(config.output_gcs_uri)
+
+
+def _run_training(config) -> None:
+    from Stage_1.trainer import Stage1Trainer
+
+    trainer = Stage1Trainer(config)
+    config_path = os.path.join(trainer.output_path, "config_stage1.json")
+    dump_config(config_path, config)
+    trainer.train()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    known, extras = _parse_args(argv)
-    stage1_args: list[str] = []
 
-    _append_flag(stage1_args, "resume_gcs_uri", known.resume_gcs_uri)
-    output_uri = _resolve_output_uri(known.output_gcs_uri)
-    _append_flag(stage1_args, "output_gcs_uri", output_uri)
-    _append_flag(stage1_args, "batch_size", known.batch_size)
-    _append_flag(stage1_args, "eval_every", known.eval_every)
-    _append_flag(stage1_args, "save_every", known.save_every)
-    _append_flag(stage1_args, "lr", known.lr)
-    _append_flag(stage1_args, "weight_decay", known.weight_decay)
-    _append_flag(stage1_args, "betas", known.betas)
-    _append_flag(stage1_args, "warmup_steps", known.warmup_steps)
-    _append_flag(stage1_args, "precision", known.dtype)
-    _append_flag(stage1_args, "device", known.device)
-    _append_flag(stage1_args, "hf_secret_name", known.hf_secret_name)
-    _append_flag(stage1_args, "hf_cache_dir", known.hf_cache_dir)
-    _append_flag(stage1_args, "seed", known.seed)
-    _append_flag(stage1_args, "log_every", known.log_every)
-    _append_flag(stage1_args, "num_workers", known.num_workers)
-    _append_flag(stage1_args, "gradient_accumulation_steps", known.gradient_accumulation_steps)
-    _append_flag(stage1_args, "max_grad_norm", known.max_grad_norm)
+    parser = _build_parser()
+    try:
+        args = parser.parse_args(list(argv) if argv is not None else None)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 1
 
-    if known.block_size is not None:
-        _append_flag(stage1_args, "seq_len", known.block_size)
-    if known.train_steps is not None:
-        _append_flag(stage1_args, "max_steps", known.train_steps)
-    if known.dataset_cfg is not None:
-        _append_flag(stage1_args, "dataset_cfg", known.dataset_cfg)
+    try:
+        config = build_config(args)
+        _ensure_paths(config)
 
-    if known.teacher_name:
-        alias = _teacher_alias(known.teacher_name)
-        if alias:
-            _append_flag(stage1_args, "teacher", alias)
-        _append_flag(stage1_args, "teacher_id", known.teacher_name)
-    _append_flag(stage1_args, "teacher_endpoint", known.teacher_endpoint)
-    _append_flag(stage1_args, "teacher_max_batch_size", known.teacher_max_batch_size)
+        project_id = _detect_project_id()
+        _prepare_hf_token(getattr(args, "hf_secret_name", None), project_id)
 
-    run_id = known.run_id or os.getenv("AIP_TRAINING_JOB_ID") or os.getenv("AIP_JOB_ID")
-    if not run_id:
-        run_id = os.getenv("AIP_TRIAL_ID") or os.getenv("CLOUD_ML_JOB_ID")
-    if not run_id:
-        run_id = str(uuid.uuid4())
-    _append_flag(stage1_args, "run_id", run_id)
+        _validate_teacher(config.teacher_name)
 
-    if known.throughput_tokens is not None:
-        _maybe_warn_unused("throughput_tokens", known.throughput_tokens)
-    if known.dataset_name:
-        _maybe_warn_unused("dataset_name", known.dataset_name)
-    if known.dataset_config:
-        _maybe_warn_unused("dataset_config", known.dataset_config)
+        use_flash_attn = _prepare_flash_attention(
+            bool(config.use_flash_attn), getattr(args, "fa_wheel_gcs_uri", None), bool(getattr(args, "allow_fa_fallback", False))
+        )
+        if use_flash_attn != bool(config.use_flash_attn):
+            config.use_flash_attn = use_flash_attn
 
-    project_hint = _resolve_project_hint(known.hf_secret_project)
-    _ensure_hf_token(known.hf_secret_name, known.hf_token_value, project_hint)
+        _finalize_output_path(config)
 
-    stage1_args.extend(extras)
+        _LOGGER.info("stage1_launch", extra={"run_id": config.run_id, "output": config.output_gcs_uri})
+        _run_training(config)
+        return 0
+    except FlashAttentionError as exc:
+        _LOGGER.error("flash_attention_install_failed: %s", exc, extra={"error": str(exc)})
+        return 1
+    except UserInputError as exc:
+        _LOGGER.error("argument_error: %s", exc, extra={"detail": str(exc)})
+        return 1
+    except KeyboardInterrupt:
+        _LOGGER.warning("stage1_interrupted", extra={"signal": "keyboard"})
+        return 130
+    except EntrypointError as exc:
+        _LOGGER.error("stage1_entrypoint_error: %s", exc, extra={"detail": str(exc)})
+        return 1
+    except Exception as exc:  # pragma: no cover - defensive catch-all
+        _LOGGER.exception("stage1_unhandled_exception", extra={"error": str(exc)})
+        return 1
 
-    cmd = " ".join(shlex.quote(arg) for arg in stage1_args)
-    print(f"{_LOG_PREFIX} Launching Stage-1 CLI with arguments: {cmd}")
-    stage1_main(stage1_args)
+
+__all__ = ["main"]
 
 
 if __name__ == "__main__":  # pragma: no cover
-    main()
+    raise SystemExit(main())
