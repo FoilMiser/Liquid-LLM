@@ -17,6 +17,22 @@ from .io import open_sharded_file
 DEFAULT_DATASET_CFG = "gs://liquid-llm-bucket-2/datasets/stage1.jsonl"
 
 
+def _env_flag(env_key: str, default: bool) -> bool:
+    value = os.getenv(env_key)
+    if value is None:
+        return default
+    lowered = str(value).lower()
+    if lowered in {"1", "true", "yes", "y"}:
+        return True
+    if lowered in {"0", "false", "no", "n"}:
+        return False
+    return default
+
+
+def _default_use_flash_attn() -> bool:
+    return _env_flag("STAGE1_USE_FLASH_ATTN", True)
+
+
 @dataclass
 class Stage1Config:
     """In-memory representation of Stage-1 experiment configuration."""
@@ -34,7 +50,7 @@ class Stage1Config:
     batch_size: int = 8
     eval_batch_size: int = 8
     throughput_tokens: int = 32_768
-    use_flash_attn: bool = True
+    use_flash_attn: bool = field(default_factory=_default_use_flash_attn)
     use_grad_ckpt: bool = True
     dtype: str = "bfloat16"
     device: str = "cuda"
@@ -148,7 +164,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--throughput_tokens", type=int, default=32_768)
-    parser.add_argument("--use_flash_attn", type=_coerce_bool, default=True)
+    parser.add_argument(
+        "--use_flash_attn",
+        type=_coerce_bool,
+        default=_env_flag("STAGE1_USE_FLASH_ATTN", True),
+    )
     parser.add_argument("--use_grad_ckpt", type=_coerce_bool, default=True)
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--device", type=str, default="cuda")
