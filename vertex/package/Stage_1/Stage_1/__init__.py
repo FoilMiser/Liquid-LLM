@@ -13,7 +13,9 @@ __all__ = ["_cli"]
 
 def _install_trainer_compatibility() -> None:
     """Expose the historic ``trainer`` module path for Vertex AI jobs."""
-    if "trainer.entrypoint" in sys.modules:
+    # If a real ``trainer`` package is already present (for example, the
+    # shims added in this repository), we leave it untouched.
+    if "trainer" in sys.modules or "trainer.entrypoint" in sys.modules:
         return
 
     entrypoint_module = import_module(".vertex.entrypoint", __name__)

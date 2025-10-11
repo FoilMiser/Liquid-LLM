@@ -31,7 +31,7 @@ package-dir = {"" = "Stage_1"}
 # All implementation now lives under the `Stage_1` namespace. A dynamic module
 # alias inside ``Stage_1.__init__`` keeps ``python -m trainer.entrypoint``
 # working for legacy job definitions without shipping a separate package.
-packages = {find = {where = ["Stage_1"], include = ["Stage_1*"]}}
+packages = {find = {where = ["Stage_1"], include = ["Stage_1*", "trainer*"]}}
 include-package-data = true
 
 [tool.setuptools.package-data]
