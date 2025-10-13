@@ -7,20 +7,20 @@ Recommended Vertex AI Custom Training configuration:
   - Accelerator: `NVIDIA_L4` (count=1)
   - Container: `us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest`
   - Local package path: `vertex/package/Stage_1`
-  - Python module: `Stage_1.cli`
+  - Python module: `Stage_1.vertex.entrypoint`
 
 Populate the Vertex console form as follows:
 
 | Field | Value |
 | ----- | ----- |
-| Python module | `Stage_1.cli` |
+| Python module | `Stage_1.vertex.entrypoint` |
 | Command line arguments | Paste the block below |
 | Output directory | `gs://liquid-llm-bucket-2/stage1/checkpoints/vertex_runs` |
 
 Run the bootstrap cell/step with:
 
 ```bash
-pip install -U pip && pip install . && python -c "import importlib; importlib.import_module('Stage_1.cli')"
+pip install -U pip && pip install . && python -c "import importlib; importlib.import_module('Stage_1.vertex.entrypoint')"
 ```
 
 Avoid adding `pip install` commands to the "Arguments" field; the package's
@@ -32,7 +32,7 @@ appends it to the output path automatically, so no shell `$(date ...)` logic is
 necessary.
 
 ```bash
-python3 -m Stage_1.cli \
+python3 -m Stage_1.vertex.entrypoint \
   --resume_gcs_uri=gs://liquid-llm-bucket-2/stage1/stage1.pt \
   --output_gcs_uri=gs://liquid-llm-bucket-2/stage1/checkpoints/vertex_runs \
   --teacher_name=meta-llama/Meta-Llama-3.1-8B \
@@ -52,7 +52,7 @@ python3 -m Stage_1.cli \
 
 ## FlashAttention wheel handling
 
-The `Stage_1.cli` module delegates to the Vertex entrypoint and handles FlashAttention wheel flags directly. Provide
+The `Stage_1.vertex.entrypoint` module handles FlashAttention wheel flags directly. Provide
 `--fa_wheel_gcs_uri=gs://...` when launching the job to download and install the
 wheel before training begins. The entrypoint strips these flags from the trainer's
 configuration to avoid "unrecognized arguments" errors.
