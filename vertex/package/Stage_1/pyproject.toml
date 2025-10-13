@@ -48,4 +48,4 @@ include = ["Stage_1*", "pythonjsonlogger*"]
 ]
 
 [project.scripts]
-stage1-train = "Stage_1.cli:main"
+stage1-train = "Stage_1.vertex.entrypoint:main"

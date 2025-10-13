@@ -3,7 +3,7 @@
 <!--
 Worker pool spec:
 local-package-path=vertex/package/Stage_1
-python-module=Stage_1.cli
+python-module=Stage_1.vertex.entrypoint
 container-image-uri=us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest
 -->
 
@@ -11,21 +11,21 @@ This package bundles the Stage-1 distillation training entrypoint for Vertex AI
 Custom Training jobs. Use the module launcher directly to avoid PATH issues:
 
 ```bash
-python -m Stage_1.cli --help
+python -m Stage_1.vertex.entrypoint --help
 ```
 
 Vertex's bootstrap command should install the local package into the interpreter
 site-packages directory:
 
 ```bash
-pip install -U pip && pip install . && python -c "import importlib; importlib.import_module('Stage_1.cli')"
+pip install -U pip && pip install . && python -c "import importlib; importlib.import_module('Stage_1.vertex.entrypoint')"
 ```
 
 ## Vertex configuration notes
 
 - **Worker pool spec**
   - Local package path: `vertex/package/Stage_1`
-  - Python module: `Stage_1.cli`
+  - Python module: `Stage_1.vertex.entrypoint`
   - Container image: `us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest`
 - Do **not** add any `pip install` commands to the Vertex "Arguments" field. The
   package already declares its dependencies.

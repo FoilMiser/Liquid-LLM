@@ -75,14 +75,14 @@ def _parse_launcher_flags(argv: List[str]) -> Tuple[bool, str, str]:
     use_fa = str(known.use_flash_attn).lower() in {"1", "true", "yes", "y"}
     return use_fa, known.fa_wheel_gcs_uri, known.fa_wheel_url
 
-def _filtered_argv_for_cli(argv: List[str]) -> List[str]:
+def _filtered_argv_for_entrypoint(argv: List[str]) -> List[str]:
     """
-    Remove the launcher's private flags (and their values) before passing to Stage_1.cli.
+    Remove the launcher's private flags (and their values) before passing to Stage_1.vertex.entrypoint.
     Supports both '--flag value' and '--flag=value'.
-    Keeps --use_flash_attn, assuming Stage_1.cli accepts it. If your CLI does NOT accept it,
+    Keeps --use_flash_attn, assuming Stage_1.vertex.entrypoint accepts it. If your entrypoint does NOT accept it,
     toggle KEEP_USE_FA_FLAG = False below to strip it and rely on env var instead.
     """
-    KEEP_USE_FA_FLAG = True  # set False if Stage_1.cli doesn't accept --use_flash_attn
+    KEEP_USE_FA_FLAG = True  # set False if Stage_1.vertex.entrypoint doesn't accept --use_flash_attn
 
     def is_flag_with_value(tok: str, name: str) -> bool:
         return tok == name or tok.startswith(name + "=")
@@ -122,9 +122,9 @@ def main():
 
     _maybe_install_fa(use_fa, fa_gcs_uri, fa_url)
 
-    filtered = _filtered_argv_for_cli(orig_argv)
+    filtered = _filtered_argv_for_entrypoint(orig_argv)
 
-    command = ["python3", "-m", "Stage_1.cli", *filtered]
+    command = ["python3", "-m", "Stage_1.vertex.entrypoint", *filtered]
     os.execvp("python3", command)
 
 if __name__ == "__main__":
