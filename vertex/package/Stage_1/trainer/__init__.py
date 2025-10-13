@@ -13,5 +13,5 @@ if "main" not in __all__ and hasattr(_entrypoint, "main"):
     main = _entrypoint.main  # type: ignore[assignment]
     __all__ = tuple(__all__) + ("main",)
 
-# Re-export the entrypoint module for ``python -m trainer.entrypoint``.
+# Re-export the entrypoint module so legacy import paths continue to function.
 entrypoint = _entrypoint
