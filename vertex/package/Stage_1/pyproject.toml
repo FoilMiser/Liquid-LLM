@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "stage-1"
 version = "0.1.0"
 requires-python = ">=3.10"
+description = "Stage 1 training package for Vertex AI"
 dependencies = [
   "torch>=2.4.0,<2.5.0",
   "transformers==4.57.0",
@@ -20,31 +21,27 @@ dependencies = [
   "gcsfs==2024.5.0",
   "google-cloud-storage==2.18.2",
   "google-cloud-secret-manager==2.24.0",
-  "pyyaml>=6.0.2",
-  "tqdm>=4.66.4",
-  "numpy>=1.26.4,<2.0",
   "pyarrow>=15.0.0,<16.0.0",
-  "python-json-logger>=2.0.7",
+  "numpy>=1.26.4,<2.0.0",
+  "pyyaml>=6.0.2",
 ]
 
-authors = []
-
 [tool.setuptools]
-package-dir = {"" = "Stage_1"}
-include-package-data = true
+package-dir = {"" = "."}
 
 [tool.setuptools.packages.find]
-where = ["Stage_1"]
-include = ["Stage_1*", "pythonjsonlogger*"]
+where = ["."]
+include = ["Stage_1*","pythonjsonlogger*"]
 
 [tool.setuptools.package-data]
 "Stage_1" = [
-    "configs/*.yaml",
-    "configs/*.jsonl",
-    "runbooks/*.txt",
-    "monitoring/*.yaml",
-    "monitoring/*.json",
-    "data/**/*.json",
+  "configs/*.yaml",
+  "configs/*.json",
+  "configs/*.jsonl",
+  "monitoring/*.yaml",
+  "monitoring/*.json",
+  "runbooks/*.txt",
+  "data/**/*.json"
 ]
 
 [project.scripts]

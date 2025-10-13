@@ -4,8 +4,8 @@ Use the following configuration when launching a Vertex AI custom training job f
 
 ## Vertex AI custom job settings
 
-- **Python module**: `Stage_1.vertex.entrypoint`
 - **Container image**: `us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest`
+- **Python module**: `Stage_1.vertex.entrypoint`
 - **Environment variable**: `PYTHONPATH=/root/.local/lib/python3.10/site-packages:${PYTHONPATH}`
 
 ### Arguments (space-separated)
@@ -32,10 +32,19 @@ Use the following configuration when launching a Vertex AI custom training job f
 
 Vertex installs uploaded Python packages into `/root/.local/lib/python3.10/site-packages`, which is not on `sys.path` by default. Setting `PYTHONPATH` to include that directory ensures Python can discover `Stage_1.vertex.entrypoint`. The entrypoint now also adds the user site-packages directory programmatically, so the module remains importable even if the environment variable is omitted.
 
-## Optional verification command
+## Local packaging verification
 
-Run this snippet inside the Vertex container to verify the package is discoverable:
+From the folder containing `pyproject.toml`, run:
 
 ```
-python3 -c "import sys,site,importlib; print(site.getusersitepackages() in sys.path); importlib.import_module('Stage_1.vertex.entrypoint'); print('entrypoint import OK')"
+python -m pip install --upgrade build
+python -m build  # creates a .whl with code included (should be >> 1.4 KB)
+
+python -m pip install --user dist/stage_1-0.1.0-py3-none-any.whl
+python -c "import sys,site,importlib; \
+print('user_site on path:', site.getusersitepackages() in sys.path); \
+importlib.import_module('Stage_1.vertex.entrypoint'); \
+print('entrypoint import OK')"
 ```
+
+These commands confirm that the wheel bundles the Stage_1 package and that the entrypoint imports correctly after installation.
