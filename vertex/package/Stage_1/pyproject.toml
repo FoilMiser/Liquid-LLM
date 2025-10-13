@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "Stage-1"
+name = "stage-1"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
@@ -23,7 +23,8 @@ dependencies = [
   "pyyaml>=6.0.2",
   "tqdm>=4.66.4",
   "numpy>=1.26.4,<2.0",
-  "pyarrow<15",
+  "pyarrow>=15.0.0,<16.0.0",
+  "python-json-logger>=2.0.7",
 ]
 
 authors = []
