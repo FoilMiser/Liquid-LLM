@@ -2,41 +2,35 @@
 
 from __future__ import annotations
 
+# --- ensure module discoverability on Vertex ---
+import sys, site, os, logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    user_site = site.getusersitepackages()
+except Exception:
+    user_site = None
+
+if user_site and user_site not in sys.path:
+    sys.path.insert(0, user_site)
+    logger.warning("Added user site-packages to sys.path: %s", user_site)
+
+for p in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+    if p and p not in sys.path:
+        sys.path.insert(0, p)
+        logger.warning("Added from PYTHONPATH to sys.path: %s", p)
+# --- end import hardening ---
+
 import argparse
 import importlib
-import logging
-import os
-import site
 import subprocess
-import sys
 import tempfile
 from importlib import metadata
 from datetime import datetime, timezone
 from typing import Sequence
 
 import pkg_resources
-
-try:
-    _user_site_paths = site.getusersitepackages()
-    if isinstance(_user_site_paths, str):
-        _user_site_paths = [_user_site_paths]
-except Exception:
-    _user_site_paths = []
-
-if not isinstance(_user_site_paths, (list, tuple, set)):
-    _user_site_paths = list(_user_site_paths or [])
-
-if _user_site_paths:
-    _insertion_index = 1 if sys.path and sys.path[0] == "" else 0
-    for _path in _user_site_paths:
-        if not _path:
-            continue
-        try:
-            sys.path.remove(_path)
-        except ValueError:
-            pass
-        sys.path.insert(_insertion_index, _path)
-        _insertion_index += 1
 
 os.environ["PATH"] = f"{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH','')}"
 
@@ -86,6 +80,19 @@ def _log_dependency_versions() -> None:
             logging.info("Resolved %s==%s", name, version)
         except Exception as exc:  # pragma: no cover - best effort logging
             logging.warning("Could not resolve %s version: %s", name, exc)
+
+
+def _preflight_imports() -> None:
+    import importlib, traceback
+
+    required = ["Stage_1.vertex.entrypoint", "transformers", "accelerate", "datasets"]
+    for mod in required:
+        try:
+            importlib.import_module(mod)
+        except Exception:
+            print(f"Failed to import {mod}")
+            traceback.print_exc()
+            raise
 
 
 def _validate_dependency_stack() -> None:
@@ -389,6 +396,7 @@ def _run_training(config) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+    # _preflight_imports()
     _log_startup_info()
 
     _log_dependency_versions()
