@@ -20,6 +20,7 @@ from .distillation import DistillationConfig, DistillationLoss, TeacherConfig, T
 from .monitoring import HealthMonitor, MetricAggregator, StructuredLogger
 from .models import ModelConfig, Stage1Model, load_stage1_checkpoint
 from .utils import WarmupCosineScheduler, config_to_dict, ensure_output_path, get_hf_token
+from .utils.attention import _have_flash_attn, pick_attention_backend
 
 
 @dataclass
@@ -37,7 +38,9 @@ class Stage1Trainer:
         self.dtype = self._select_dtype(config.dtype, self.device)
 
         if config.block_size > config.seq_len:
-            raise ValueError("block_size must be less than or equal to seq_len")
+            raise ValueError(
+                f"block_size ({config.block_size}) must be less than or equal to seq_len ({config.seq_len})"
+            )
 
         self.output_path = config.output_gcs_uri or "./stage1_output"
         if self.output_path and not self.output_path.startswith("gs://"):
@@ -46,14 +49,17 @@ class Stage1Trainer:
         self.logger = StructuredLogger(self.output_path, run_id=config.run_id, git_sha=self._git_sha())
         self.health = HealthMonitor(self.logger, max_grad_norm=config.max_grad_norm)
 
+        self.attention_backend = "sdpa"
+        if self.device.type == "cuda" and self.config.use_flash_attn and _have_flash_attn():
+            self.attention_backend = "flash"
+
         self._tokens_since_log = 0
         self._last_log_time = time.time()
         self.last_tokens_per_sec = 0.0
         self.last_gpu_mem = 0.0
         self.last_grad_norm = 0.0
-
-        if self.device.type == "cuda":
-            self._configure_sdp()
+        self._last_tokens_per_step_effective = 0
+        self._last_max_allocated_vram_mb = 0
 
         project_id = self._detect_project_id()
         secret_name = getattr(config, "hf_secret_name", None)
@@ -81,7 +87,7 @@ class Stage1Trainer:
             dropout=config.dropout,
             layer_norm_eps=config.layer_norm_eps,
             gradient_checkpointing=config.use_grad_ckpt,
-            use_flash_attn=config.use_flash_attn,
+            use_flash_attn=self.attention_backend == "flash",
         )
         self.model = Stage1Model(self.model_config).to(self.device)
         if self.dtype != torch.float32:
@@ -164,16 +170,6 @@ class Stage1Trainer:
             return torch.float16
         return torch.float32
 
-    def _configure_sdp(self) -> None:
-        try:
-            torch.backends.cuda.sdp_kernel(  # type: ignore[attr-defined]
-                enable_flash=self.config.use_flash_attn,
-                enable_math=not self.config.use_flash_attn,
-                enable_mem_efficient=not self.config.use_flash_attn,
-            )
-        except Exception:  # pragma: no cover - defensive, kernels vary by runtime
-            pass
-
     def _load_tokenizer(self, tokenizer_name: str, hf_token: Optional[str]):
         auth_kwargs: Dict[str, object] = {}
         if hf_token:
@@ -237,6 +233,8 @@ class Stage1Trainer:
             use_flash_attn=self.config.use_flash_attn,
             use_grad_ckpt=self.config.use_grad_ckpt,
             throughput_target=self.config.throughput_tokens,
+            grad_accum_steps=self.config.gradient_accumulation_steps,
+            attention_backend=self.attention_backend,
         )
 
     def _resume_from_checkpoint(self) -> None:
@@ -342,17 +340,22 @@ class Stage1Trainer:
     def _eval(self) -> Dict[str, float]:
         self.model.eval()
         aggregator = MetricAggregator()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         with torch.no_grad():
             batch = self._next_batch(self.config.eval_batch_size)
-            logits = self.model(batch["input_ids"], attention_mask=batch["attention_mask"])
+            with pick_attention_backend(self.config.use_flash_attn):
+                logits = self.model(batch["input_ids"], attention_mask=batch["attention_mask"])
+                teacher_logits = logits.detach()
+                if self.teacher is not None:
+                    teacher_logits = self.teacher.logits(
+                        batch["input_ids"], attention_mask=batch["attention_mask"]
+                    )
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 batch["labels"].view(-1),
                 ignore_index=-100,
             )
-            teacher_logits = logits.detach()
-            if self.teacher is not None:
-                teacher_logits = self.teacher.logits(batch["input_ids"], attention_mask=batch["attention_mask"])
             metrics = self.distillation(self.state.step, logits, teacher_logits, batch["labels"])
             aggregator.update(
                 loss=float(loss.item()),
@@ -363,7 +366,15 @@ class Stage1Trainer:
                 gpu_mem_reserved=self.last_gpu_mem,
             )
         self.model.train()
-        return aggregator.compute()
+        computed = aggregator.compute()
+        max_allocated = 0
+        if torch.cuda.is_available():
+            max_allocated = int(torch.cuda.max_memory_allocated() // 2**20)
+        self._last_max_allocated_vram_mb = max_allocated
+        computed["tokens_per_step_effective"] = float(self._last_tokens_per_step_effective)
+        computed["attn_backend"] = self.attention_backend
+        computed["max_allocated_vram_mb"] = float(max_allocated)
+        return computed
 
     # ------------------------------------------------------------------
     def train(self) -> None:
@@ -380,25 +391,27 @@ class Stage1Trainer:
             batch = self._next_batch(self.config.batch_size)
             tokens_in_batch = int(batch["attention_mask"].sum().item())
             self._tokens_since_log += tokens_in_batch
+            self._last_tokens_per_step_effective = tokens_in_batch * grad_accum
 
             try:
-                with torch.autocast(
-                    device_type=self.device.type,
-                    dtype=autocast_dtype,
-                    enabled=autocast_enabled,
-                ):
-                    logits = self.model(batch["input_ids"], attention_mask=batch["attention_mask"])
-                    teacher_logits = logits.detach()
-                    if self.teacher is not None:
-                        teacher_logits = self.teacher.logits(
-                            batch["input_ids"], attention_mask=batch["attention_mask"]
+                with pick_attention_backend(self.config.use_flash_attn):
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        dtype=autocast_dtype,
+                        enabled=autocast_enabled,
+                    ):
+                        logits = self.model(batch["input_ids"], attention_mask=batch["attention_mask"])
+                        teacher_logits = logits.detach()
+                        if self.teacher is not None:
+                            teacher_logits = self.teacher.logits(
+                                batch["input_ids"], attention_mask=batch["attention_mask"]
+                            )
+                        distil = self.distillation(
+                            step,
+                            logits,
+                            teacher_logits,
+                            batch["labels"],
                         )
-                    distil = self.distillation(
-                        step,
-                        logits,
-                        teacher_logits,
-                        batch["labels"],
-                    )
                     total_loss = distil["total_loss"]
                     loss = total_loss / grad_accum
                 self.health.check_loss(total_loss.detach())
@@ -408,6 +421,24 @@ class Stage1Trainer:
                     self.health.record_oom()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                        torch.cuda.reset_peak_memory_stats()
+                    if self.config.throughput_tokens and self.config.batch_size > 1:
+                        self.config.batch_size = max(1, self.config.batch_size // 2)
+                        if self.config.seq_len > 0:
+                            grad_accum = max(
+                                grad_accum,
+                                math.ceil(
+                                    self.config.throughput_tokens
+                                    / max(1, self.config.batch_size * self.config.seq_len)
+                                ),
+                            )
+                            self.config.gradient_accumulation_steps = grad_accum
+                        self.logger.info(
+                            "oom_adjustment",
+                            batch_size=self.config.batch_size,
+                            grad_accum_steps=grad_accum,
+                            throughput_tokens=self.config.throughput_tokens,
+                        )
                     continue
                 raise
 
@@ -431,11 +462,15 @@ class Stage1Trainer:
                     loss=float(total_loss.detach().item()),
                     lr=float(self.optimizer.param_groups[0]["lr"]),
                     tokens=int(self._tokens_since_log),
+                    tokens_per_step_effective=int(self._last_tokens_per_step_effective),
+                    attention_backend=self.attention_backend,
                 )
                 self._last_log_time = now
                 self._tokens_since_log = 0
 
             if step % self.config.eval_every == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
                 metrics = self._eval()
                 self.logger.metric(step, metrics)
                 if self.config.use_checkpoint_saver:

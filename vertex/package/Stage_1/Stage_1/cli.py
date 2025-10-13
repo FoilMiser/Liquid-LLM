@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from datetime import datetime, timezone
+from importlib import resources
 
 from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
@@ -18,9 +21,58 @@ from .utils import (
     get_hf_token,
     path_exists,
 )
+from .utils.attention import _have_flash_attn
 
 CANONICAL_TEACHER = "meta-llama/Meta-Llama-3.1-8B"
 TOKEN_ENV_KEYS = ("HF_TOKEN", "HF_API_TOKEN", "HUGGINGFACEHUB_API_TOKEN")
+
+
+def _find_flash_wheel() -> str | None:
+    try:
+        wheels_dir = resources.files("Stage_1").joinpath("wheels")
+    except Exception:
+        return None
+    try:
+        for entry in wheels_dir.iterdir():
+            if entry.name.endswith(".whl"):
+                return str(entry)
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def _ensure_flash_attention(enable_flash: bool, allow_install: bool) -> bool:
+    if not enable_flash:
+        return False
+    if _have_flash_attn():
+        return True
+    if not allow_install:
+        return False
+    wheel_path = _find_flash_wheel()
+    if not wheel_path:
+        print("FlashAttention wheel not packaged; falling back to SDPA.")
+        return False
+    print(f"Attempting local FlashAttention install from {wheel_path}...")
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                wheel_path,
+                "--no-deps",
+                "--no-warn-script-location",
+            ],
+            check=False,
+        )
+    except Exception as exc:
+        print(f"FlashAttention wheel install failed: {exc}. Falling back to SDPA.")
+        return False
+    if _have_flash_attn():
+        return True
+    print("FlashAttention remains unavailable after install attempt; using SDPA.")
+    return False
 
 
 def _validate_teacher(name: str) -> None:
@@ -104,6 +156,13 @@ def main(argv: list[str] | None = None) -> None:
         for env_key in TOKEN_ENV_KEYS:
             os.environ.setdefault(env_key, token)
 
+    flash_enabled = bool(config.use_flash_attn)
+    allow_install = bool(getattr(config, "flash_wheel_install", True))
+    have_flash = _ensure_flash_attention(flash_enabled, allow_install)
+    if flash_enabled and not have_flash:
+        print("Warning: FlashAttention unavailable; falling back to SDPA.")
+    config.use_flash_attn = bool(flash_enabled and have_flash)
+
     _validate_teacher(config.teacher_name)
     if not config.run_id:
         config.run_id = datetime.now(timezone.utc).strftime("stage1-%Y%m%d-%H%M%S")
@@ -112,6 +171,22 @@ def main(argv: list[str] | None = None) -> None:
         config.output_gcs_uri = f"{base_uri}/{config.run_id}"
     if config.output_gcs_uri and not config.output_gcs_uri.startswith("gs://"):
         ensure_output_path(config.output_gcs_uri)
+    backend = "flash" if config.use_flash_attn and _have_flash_attn() else "sdpa"
+    derived_grad = getattr(config, "extra", {}).get("derived_grad_accum_steps")
+    if derived_grad is not None:
+        print(
+            "Adjusted gradient_accumulation_steps to "
+            f"{config.gradient_accumulation_steps} for throughput target"
+        )
+    print(
+        "resolved_config: "
+        f"seq_len={config.seq_len}, "
+        f"block_size={config.block_size}, "
+        f"batch_size={config.batch_size}, "
+        f"grad_accum_steps={config.gradient_accumulation_steps}, "
+        f"throughput_tokens={config.throughput_tokens}"
+    )
+    print(f"attention_backend={backend}")
     trainer = Stage1Trainer(config)
     config_path = os.path.join(trainer.output_path, "config_stage1.json")
     dump_config(config_path, config)

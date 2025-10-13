@@ -34,6 +34,7 @@ class Stage1Config:
     batch_size: int = 8
     eval_batch_size: int = 8
     throughput_tokens: int = 32_768
+    flash_wheel_install: bool = True
     use_flash_attn: bool = True
     use_grad_ckpt: bool = True
     dtype: str = "bfloat16"
@@ -148,6 +149,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--throughput_tokens", type=int, default=32_768)
+    parser.add_argument("--flash_wheel_install", type=_coerce_bool, default=True)
     parser.add_argument("--use_flash_attn", type=_coerce_bool, default=True)
     parser.add_argument("--use_grad_ckpt", type=_coerce_bool, default=True)
     parser.add_argument("--dtype", type=str, default="bfloat16")
@@ -210,9 +212,24 @@ def build_config(args: argparse.Namespace) -> Stage1Config:
     for key in extra_keys:
         extra[key] = cfg_dict.pop(key)
     cfg = Stage1Config(**cfg_dict)
+    if cfg.block_size > cfg.seq_len:
+        raise ValueError(
+            f"block_size ({cfg.block_size}) must be less than or equal to seq_len ({cfg.seq_len})"
+        )
     if not cfg.tokenizer_name:
         cfg.tokenizer_name = cfg.teacher_name
     cfg.dtype = str(cfg.dtype).lower()
+    if cfg.throughput_tokens and cfg.seq_len > 0 and cfg.batch_size > 0:
+        tokens_per_batch = cfg.batch_size * cfg.seq_len
+        target_tokens = int(cfg.throughput_tokens)
+        if tokens_per_batch != target_tokens:
+            from math import ceil
+
+            derived = max(1, ceil(target_tokens / max(1, tokens_per_batch)))
+            if derived != cfg.gradient_accumulation_steps:
+                cfg.gradient_accumulation_steps = derived
+            extra["derived_grad_accum_steps"] = derived
+        extra["target_tokens_per_step"] = target_tokens
     cfg.extra = extra
     return cfg
 
