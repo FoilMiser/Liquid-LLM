@@ -35,7 +35,7 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["Stage_1"]
-include = ["Stage_1*", "trainer*"]
+include = ["Stage_1*", "pythonjsonlogger*"]
 
 [tool.setuptools.package-data]
 "Stage_1" = [
