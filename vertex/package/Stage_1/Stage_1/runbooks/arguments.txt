@@ -8,6 +8,7 @@
 --batch_size=8
 --throughput_tokens=32768
 --use_flash_attn=true
+--fa_wheel_gcs_uri=gs://liquid-llm-bucket-2/FlashAttention/flash_attn-2.8.3+cu12torch2.4cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
 --use_grad_ckpt=true
 --dtype=bfloat16
 --device=cuda
