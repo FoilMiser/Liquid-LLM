@@ -17,11 +17,27 @@ from typing import Sequence
 import pkg_resources
 
 try:
-    us = site.getusersitepackages()
-    if us and us not in sys.path:
-        sys.path.append(us)
+    _user_site_paths = site.getusersitepackages()
+    if isinstance(_user_site_paths, str):
+        _user_site_paths = [_user_site_paths]
 except Exception:
-    pass
+    _user_site_paths = []
+
+if not isinstance(_user_site_paths, (list, tuple, set)):
+    _user_site_paths = list(_user_site_paths or [])
+
+if _user_site_paths:
+    _insertion_index = 1 if sys.path and sys.path[0] == "" else 0
+    for _path in _user_site_paths:
+        if not _path:
+            continue
+        try:
+            sys.path.remove(_path)
+        except ValueError:
+            pass
+        sys.path.insert(_insertion_index, _path)
+        _insertion_index += 1
+
 os.environ["PATH"] = f"{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH','')}"
 
 
