@@ -6,13 +6,24 @@ import argparse
 import importlib
 import logging
 import os
+import site
 import subprocess
 import sys
 import tempfile
+from importlib import metadata
 from datetime import datetime, timezone
 from typing import Sequence
 
 import pkg_resources
+
+try:
+    us = site.getusersitepackages()
+    if us and us not in sys.path:
+        sys.path.append(us)
+except Exception:
+    pass
+os.environ["PATH"] = f"{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH','')}"
+
 
 from Stage_1.logging_utils import get_logger
 from Stage_1.utils import (
@@ -32,6 +43,23 @@ _TOKEN_ENV_VARS = (
     "HF_API_TOKEN",
     "HUGGINGFACEHUB_API_TOKEN",
 )
+
+
+def _log_startup_info() -> None:
+    try:
+        version = metadata.version("Stage-1")
+    except metadata.PackageNotFoundError:
+        version = "unknown"
+
+    sys_path_preview = sys.path[:5]
+    _LOGGER.info(
+        "stage1_startup",
+        extra={
+            "version": version,
+            "executable": sys.executable,
+            "sys_path": sys_path_preview,
+        },
+    )
 
 
 def _log_dependency_versions() -> None:
@@ -283,6 +311,8 @@ def _run_training(config) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    _log_startup_info()
 
     _log_dependency_versions()
     _validate_dependency_stack()
