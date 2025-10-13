@@ -47,7 +47,7 @@ _TOKEN_ENV_VARS = (
 
 def _log_startup_info() -> None:
     try:
-        version = metadata.version("Stage-1")
+        version = metadata.version("stage-1")
     except metadata.PackageNotFoundError:
         version = "unknown"
 
@@ -63,7 +63,7 @@ def _log_startup_info() -> None:
 
 
 def _log_dependency_versions() -> None:
-    for name in ["datasets", "fsspec", "gcsfs"]:
+    for name in ["datasets", "fsspec", "gcsfs", "pyarrow"]:
         try:
             importlib.import_module(name)
             version = pkg_resources.get_distribution(name).version
@@ -93,6 +93,67 @@ def _validate_dependency_stack() -> None:
             "Incompatible dependency stack detected: datasets==2.20.0 expects fsspec<=2024.5.0, but fsspec=="
             f"{fsspec_version} was resolved. Update the environment to use fsspec==2024.5.0 or adjust the dataset version before training."
         )
+
+    try:
+        pyarrow_version = pkg_resources.get_distribution("pyarrow").version
+    except Exception as exc:
+        raise EntrypointError(
+            "datasets==2.20.0 requires pyarrow>=15.0.0,<16.0.0; install an appropriate pyarrow build before launching training."
+        ) from exc
+
+    parsed_pyarrow = pkg_resources.parse_version(pyarrow_version)
+    if not (
+        pkg_resources.parse_version("15.0.0")
+        <= parsed_pyarrow
+        < pkg_resources.parse_version("16.0.0")
+    ):
+        raise EntrypointError(
+            "Incompatible dependency stack detected: datasets==2.20.0 expects pyarrow>=15.0.0,<16.0.0, but pyarrow=="
+            f"{pyarrow_version} was resolved. Update the environment or adjust the dataset version before training."
+        )
+
+
+def _run_startup_health_checks() -> None:
+    summary: dict[str, object] = {}
+
+    try:
+        import torch
+
+        cuda_available = torch.cuda.is_available()
+        summary["cuda_available"] = bool(cuda_available)
+        if cuda_available:
+            summary["cuda_device_count"] = torch.cuda.device_count()
+    except Exception as exc:  # pragma: no cover - defensive
+        _LOGGER.warning("stage1_cuda_probe_failed", extra={"detail": str(exc)})
+
+    for module_name in ("transformers", "datasets", "pyarrow", "numpy"):
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:
+            raise EntrypointError(
+                f"Required dependency '{module_name}' failed to import after bootstrap: {exc}"
+            ) from exc
+
+    try:
+        pyarrow_version = pkg_resources.get_distribution("pyarrow").version
+    except Exception as exc:
+        raise EntrypointError(
+            "pyarrow>=15.0.0 is required for datasets==2.20.0 but was not found; verify the bootstrap installation logs."
+        ) from exc
+
+    if pkg_resources.parse_version(pyarrow_version) < pkg_resources.parse_version("15.0.0"):
+        raise EntrypointError(
+            f"pyarrow>=15.0.0 is required for Stage-1 training; resolved pyarrow=={pyarrow_version}. Update the environment and retry."
+        )
+
+    try:
+        torch_version = pkg_resources.get_distribution("torch").version
+        summary["torch"] = torch_version
+    except Exception:  # pragma: no cover - best effort
+        pass
+
+    summary["pyarrow"] = pyarrow_version
+    _LOGGER.info("stage1_health_check", extra=summary)
 
 
 class EntrypointError(Exception):
@@ -316,6 +377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     _log_dependency_versions()
     _validate_dependency_stack()
+    _run_startup_health_checks()
 
     parser = _build_parser()
     try:
