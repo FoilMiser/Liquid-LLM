@@ -1,9 +1,0 @@
-{"path": "gs://liquid-llm-bucket-2/datasets/wikitext103/*.jsonl", "type": "lm", "dataset": "wikitext-103", "weight": 1.0}
-{"path": "gs://liquid-llm-bucket-2/datasets/wikipedia_clean/*.jsonl", "type": "lm", "dataset": "wikipedia-clean", "weight": 0.7}
-{"path": "gs://liquid-llm-bucket-2/datasets/c4_filtered_small/*.jsonl", "type": "lm", "dataset": "c4-filtered-small", "weight": 0.6}
-{"path": "gs://liquid-llm-bucket-2/datasets/fineweb_edu/*.jsonl", "type": "lm", "dataset": "fineweb-edu", "weight": 0.5}
-{"path": "gs://liquid-llm-bucket-2/datasets/dolma_open/*.jsonl", "type": "lm", "dataset": "dolma-open", "weight": 0.5}
-{"path": "gs://liquid-llm-bucket-2/datasets/tools/gsm8k/*.jsonl", "type": "math_tool", "dataset": "gsm8k-tool", "weight": 0.2}
-{"path": "gs://liquid-llm-bucket-2/datasets/tools/svamp/*.jsonl", "type": "math_tool", "dataset": "svamp-tool", "weight": 0.2}
-{"path": "gs://liquid-llm-bucket-2/datasets/tools/asdiv/*.jsonl", "type": "math_tool", "dataset": "asdiv-tool", "weight": 0.15}
-{"path": "gs://liquid-llm-bucket-2/datasets/code/stack_v2_filtered/*.jsonl", "type": "code", "dataset": "stack-v2-code", "weight": 0.1}
