@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -66,6 +67,7 @@ class JsonFormatter(logging.Formatter):
         log_record.setdefault("name", record.name)
         log_record.setdefault("levelname", record.levelname)
         log_record.setdefault("message", record.getMessage())
+        log_record.setdefault("created", getattr(record, "created", time.time()))
         log_record.update(message_dict)
 
     def process_log_record(self, log_record: dict[str, Any]) -> dict[str, Any]:
