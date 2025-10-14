@@ -1,0 +1,13 @@
+# Ignore large or binary artifacts from training runs
+*.whl
+*.pt
+*.bin
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+*.ckpt
+checkpoints*/
+artifacts*/
+**/checkpoints*/
+**/artifacts*/
