@@ -19,7 +19,6 @@ __all__ = ["JsonFormatter"]
 
 def _default(obj: Any) -> Any:
     """Fallback ``json.dumps`` serializer that stringifies unknown objects."""
-
     try:
         return str(obj)
     except Exception:  # pragma: no cover - very defensive
@@ -67,6 +66,7 @@ class JsonFormatter(logging.Formatter):
         log_record.setdefault("name", record.name)
         log_record.setdefault("levelname", record.levelname)
         log_record.setdefault("message", record.getMessage())
+        # Vertex AI's sitecustomize expects "created" to exist
         log_record.setdefault("created", getattr(record, "created", time.time()))
         log_record.update(message_dict)
 
