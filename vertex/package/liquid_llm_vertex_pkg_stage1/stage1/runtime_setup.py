@@ -25,28 +25,29 @@ def login_hf(token_env: str = "HF_TOKEN") -> None:
     logger.info("Authenticated with Hugging Face Hub using token env %s", token_env)
 
 
-def install_flash_attn_from_gcs(gcs_wheel_uri: str, target_dir: str = "/tmp/wheels") -> None:
+def install_flash_attn_from_gcs(gcs_wheel_uri: str, target_dir: str = "/tmp/wheels") -> bool:
     """Download a FlashAttention wheel from GCS and install it without deps."""
 
     if not gcs_wheel_uri:
         logger.warning("No FlashAttention wheel URI provided; skipping installation")
-        return
+        return False
     Path(target_dir).mkdir(parents=True, exist_ok=True)
     local_path = Path(target_dir) / Path(gcs_wheel_uri).name
     cmd = ["gcloud", "storage", "cp", gcs_wheel_uri, str(local_path)]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         logger.error("Failed to download FlashAttention wheel: %s", result.stderr)
-        return
+        return False
     install_cmd = ["pip", "install", "--no-deps", str(local_path)]
     install_result = subprocess.run(install_cmd, capture_output=True, text=True, check=False)
     if install_result.returncode == 0:
         logger.info("Installed FlashAttention wheel from %s", gcs_wheel_uri)
-    else:
-        logger.error("Failed to install FlashAttention: %s", install_result.stderr)
+        return True
+    logger.error("Failed to install FlashAttention: %s", install_result.stderr)
+    return False
 
 
-def enable_flash_attn_if_available() -> bool:
+def enable_flash_attn_if_available(*, log: bool = True) -> bool:
     """Enable PyTorch scaled-dot-product attention optimizations when available."""
 
     try:
@@ -56,7 +57,10 @@ def enable_flash_attn_if_available() -> bool:
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_math_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(True)
-        logger.info("Enabled FlashAttention/SDP kernels")
+        if log:
+            logger.info("Enabled FlashAttention/SDP kernels")
+        else:
+            logger.debug("FlashAttention/SDP kernels enabled")
         return True
     except Exception as exc:  # pragma: no cover - safety net
         logger.warning("Could not enable FlashAttention kernels: %s", exc)

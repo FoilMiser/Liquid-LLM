@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -53,7 +54,22 @@ class Attention(nn.Module):
         q = self.q_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start = time.perf_counter()
         attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if not getattr(self, "_sdpa_logged", False):
+            backend = "SDPA path active"
+            try:
+                if not torch.backends.cuda.sdp_kernel.is_flash_enabled():
+                    backend = "SDPA fallback"
+            except AttributeError:
+                backend = "SDPA fallback"
+            logger.info("Attention backend check: %s | duration_ms=%.3f", backend, elapsed_ms)
+            self._sdpa_logged = True
         out = attn.transpose(1, 2).contiguous().view(bsz, seq_len, hidden)
         return self.out_proj(out)
 
@@ -169,16 +185,22 @@ def apply_grad_checkpointing(model: nn.Module, enabled: bool) -> nn.Module:
         return model
     import torch.utils.checkpoint as cp
 
-    for module in model.modules():
-        name = module.__class__.__name__.lower()
-        if name.endswith("block") or name.endswith("layer"):
-            if getattr(module, "_checkpoint_wrapped", False):
+    if hasattr(model, "blocks"):
+        for block in model.blocks:
+            if getattr(block, "_checkpoint_wrapped", False):
                 continue
-            orig_forward = module.forward
 
-            def checkpointed_forward(*args, _orig=orig_forward, **kwargs):
-                return cp.checkpoint(_orig, *args, **kwargs)
+            def _make_forward(module):
+                orig_forward = module.forward
 
-            module.forward = checkpointed_forward  # type: ignore[assignment]
-            setattr(module, "_checkpoint_wrapped", True)
+                def _wrapped_forward(*inputs, **kwargs):
+                    def _inner(*inner_inputs):
+                        return orig_forward(*inner_inputs, **kwargs)
+
+                    return cp.checkpoint(_inner, *inputs, use_reentrant=False)
+
+                return _wrapped_forward
+
+            block.forward = _make_forward(block)  # type: ignore[assignment]
+            setattr(block, "_checkpoint_wrapped", True)
     return model

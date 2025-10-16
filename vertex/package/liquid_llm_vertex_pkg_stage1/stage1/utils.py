@@ -71,6 +71,12 @@ def set_seed(seed: int) -> None:
 
     random.seed(seed)
     torch.manual_seed(seed)
+    try:
+        import numpy as np  # type: ignore
+
+        np.random.seed(seed)
+    except Exception:  # pragma: no cover - optional dependency
+        pass
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
