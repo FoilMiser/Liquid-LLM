@@ -1,6 +1,6 @@
 import sys
+import math
 from pathlib import Path
-from unittest import mock
 
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -67,11 +67,10 @@ def test_trainer_computes_online_kd(tmp_path):
         teacher_logits_dir=None,
         eval_every=0,
         save_every=0,
+        metrics_interval=1,
     )
-    def fake_kd(student_logits, teacher_logits, temperature):
-        assert torch.isfinite(teacher_logits).all()
-        return (student_logits - teacher_logits.detach()).pow(2).mean()
-
-    with mock.patch("stage1.train.losses.kd_loss", side_effect=fake_kd) as kd_mock:
-        trainer.train()
-        assert kd_mock.called
+    trainer.train()
+    metrics = trainer._last_metrics
+    assert metrics is not None
+    assert math.isfinite(metrics["kd_loss"])
+    assert metrics["kd_loss"] > 0

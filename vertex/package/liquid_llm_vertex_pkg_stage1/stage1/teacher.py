@@ -35,6 +35,12 @@ class TeacherWrapper:
         for param in self.model.parameters():
             param.requires_grad = False
         self.device = next(self.model.parameters()).device
+        logger.info(
+            "Teacher ready | vocab_size=%d | device=%s | dtype=%s",
+            len(self.tokenizer),
+            self.device,
+            config.dtype,
+        )
 
     @torch.inference_mode()
     def logits(self, input_ids: torch.Tensor) -> torch.Tensor:

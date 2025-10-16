@@ -112,8 +112,10 @@ def _resolve_dataset_path(
     if not spec:
         return raw_path
     extension = Path(raw_path).suffix
-    if extension in {".parquet", ".gz"} and shards_ready(spec.out):
+    if shards_ready(spec.out):
         return spec.shard_glob()
+    if extension in {".jsonl", ".json", ".json.gz", ".parquet"}:
+        return raw_path
     return raw_path
 
 
@@ -197,23 +199,33 @@ class ManifestDataset(Dataset):
         self.teacher_mode = teacher_mode
         self.teacher_logits_dir = teacher_logits_dir.rstrip("/") if teacher_logits_dir else None
         self._teacher_cache: Dict[str, torch.Tensor] = {}
+        self._auto_sample_counts: Dict[str, int] = defaultdict(int)
+        self._bad_shape_warned: set[str] = set()
+        self._missing_warned: set[str] = set()
+        self._epoch_total = 0
+        self._epoch_missing = 0
         self._build_index()
 
     def _build_index(self) -> None:
-        running_id = 0
         counts: Dict[str, int] = defaultdict(int)
         for entry in self.entries:
             resolved_paths = expand_gcs_pattern(entry.resolved_path)
             dataset_key = entry.dataset_id or entry.resolved_path
             for path in resolved_paths:
-                for obj in load_records(path):
+                for row_idx, obj in enumerate(load_records(path)):
                     text = obj.get("text", "")
                     if not isinstance(text, str) or not text:
                         continue
                     sample_type = obj.get("type", entry.type)
                     if sample_type == "math_tool":
                         text = tool_use.traces.maybe_inject_tool_result(text)
-                    sample_id = obj.get("sample_id") or f"{dataset_key}_sample_{running_id}"
+                    sample_id = obj.get("sample_id")
+                    if not sample_id:
+                        digest = hashlib.sha1(
+                            f"{path}:{row_idx}:{text[:200]}".encode("utf-8")
+                        ).hexdigest()
+                        sample_id = f"auto_{digest}"
+                        self._auto_sample_counts[dataset_key] += 1
                     payload = {
                         "text": text,
                         "type": sample_type,
@@ -221,9 +233,23 @@ class ManifestDataset(Dataset):
                     }
                     self.samples.append(payload)
                     counts[dataset_key] += 1
-                    running_id += 1
         self.dataset_counts = dict(counts)
+        self.auto_sample_counts = dict(self._auto_sample_counts)
         logger.info("Loaded %d samples from manifest", len(self.samples))
+        for dataset_key, missing in self._auto_sample_counts.items():
+            if missing:
+                logger.warning(
+                    "Dataset %s missing sample_id for %d records; auto-generated using SHA1",
+                    dataset_key,
+                    missing,
+                )
+
+    def begin_epoch(self) -> None:
+        self._epoch_total = 0
+        self._epoch_missing = 0
+
+    def epoch_teacher_stats(self) -> tuple[int, int]:
+        return self._epoch_total, self._epoch_missing
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -244,9 +270,13 @@ class ManifestDataset(Dataset):
             "sample_id": sample["sample_id"],
         }
         if self.teacher_mode == "precompute" and self.teacher_logits_dir:
-            logits = self._load_teacher_logits(sample["sample_id"])
+            logits, status = self._load_teacher_logits(sample["sample_id"])
+            self._epoch_total += 1
+            if status in {"missing", "invalid"}:
+                self._epoch_missing += 1
             if logits is not None:
                 item["teacher_logits"] = logits
+            item["teacher_status"] = status
         return item
 
     def _materialize_teacher_path(self, sample_id: str, ext: str) -> Optional[str]:
@@ -281,11 +311,11 @@ class ManifestDataset(Dataset):
             logits = logits[:, :target_vocab]
         return logits
 
-    def _load_teacher_logits(self, sample_id: str) -> Optional[torch.Tensor]:
+    def _load_teacher_logits(self, sample_id: str) -> tuple[Optional[torch.Tensor], str]:
         if sample_id in self._teacher_cache:
-            return self._teacher_cache[sample_id]
+            return self._teacher_cache[sample_id], "cached"
         if not self.teacher_logits_dir:
-            return None
+            return None, "disabled"
         for ext in (".pt", ".npy"):
             path = self._materialize_teacher_path(sample_id, ext)
             if not path:
@@ -297,10 +327,24 @@ class ManifestDataset(Dataset):
                     tensor = torch.from_numpy(np.load(path, allow_pickle=False))
             except Exception:
                 continue
-            logits = self._normalize_teacher_logits(torch.as_tensor(tensor))
+            logits = torch.as_tensor(tensor)
+            if logits.dim() != 2:
+                key = f"shape:{Path(path).suffix}"
+                if key not in self._bad_shape_warned:
+                    self._bad_shape_warned.add(key)
+                    logger.warning(
+                        "Teacher logits at %s have invalid shape %s; expected [T, V]; skipping",
+                        path,
+                        tuple(logits.shape),
+                    )
+                return None, "invalid"
+            logits = self._normalize_teacher_logits(logits)
             self._teacher_cache[sample_id] = logits
-            return logits
-        return None
+            return logits, "ok"
+        if sample_id not in self._missing_warned:
+            self._missing_warned.add(sample_id)
+            logger.warning("Teacher logits missing for sample %s", sample_id)
+        return None, "missing"
 
 
 def build_tokenizer(model_id: str) -> PreTrainedTokenizerBase:
