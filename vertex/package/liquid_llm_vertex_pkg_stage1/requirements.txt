@@ -3,3 +3,4 @@ huggingface_hub>=0.23.0
 torch==2.4.0
 numpy
 pytest
+pyyaml
