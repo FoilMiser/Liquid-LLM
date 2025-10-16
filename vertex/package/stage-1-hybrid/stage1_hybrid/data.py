@@ -350,9 +350,9 @@ class ManifestDataset(Dataset):
             logits = logits[:, :target_vocab]
         return logits
 
-    def _load_teacher_logits(
-        self, sample_id: str, directory: str, tag: str
-    ) -> tuple[Optional[torch.Tensor], str]:
+def _load_teacher_logits(
+    self, sample_id: str, directory: str, tag: str
+) -> tuple[Optional[torch.Tensor], str]:
         cache_key = (directory, sample_id)
         if cache_key in self._teacher_cache:
             return self._teacher_cache[cache_key], "cached"
