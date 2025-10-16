@@ -198,6 +198,7 @@ class ManifestDataset(Dataset):
         self.dataset_counts: Dict[str, int] = {}
         self.teacher_mode = teacher_mode
         self.teacher_logits_dir = teacher_logits_dir.rstrip("/") if teacher_logits_dir else None
+        self._teacher_cache: Dict[str, torch.Tensor] = {}
         self._auto_sample_counts: Dict[str, int] = defaultdict(int)
         self._bad_shape_warned: set[str] = set()
         self._missing_warned: set[str] = set()
@@ -311,6 +312,8 @@ class ManifestDataset(Dataset):
         return logits
 
     def _load_teacher_logits(self, sample_id: str) -> tuple[Optional[torch.Tensor], str]:
+        if sample_id in self._teacher_cache:
+            return self._teacher_cache[sample_id], "cached"
         if not self.teacher_logits_dir:
             return None, "disabled"
         for ext in (".pt", ".npy"):
@@ -336,6 +339,7 @@ class ManifestDataset(Dataset):
                     )
                 return None, "invalid"
             logits = self._normalize_teacher_logits(logits)
+            self._teacher_cache[sample_id] = logits
             return logits, "ok"
         if sample_id not in self._missing_warned:
             self._missing_warned.add(sample_id)

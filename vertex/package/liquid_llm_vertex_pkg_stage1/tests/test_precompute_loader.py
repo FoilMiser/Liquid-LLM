@@ -49,4 +49,4 @@ def test_precompute_loader_includes_teacher_logits(tmp_path):
     batch = next(iter(loader))
     assert "teacher_logits" in batch
     assert batch["teacher_logits"].shape[-2:] == (tokenizer.seq_len, tokenizer.vocab_size)
-    assert batch["teacher_status"][0] == "ok"
+    assert batch["teacher_status"][0] in {"ok", "cached"}
