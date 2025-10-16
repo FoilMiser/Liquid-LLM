@@ -54,15 +54,14 @@ class Attention(nn.Module):
         q = self.q_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        should_log = not getattr(self, "_sdpa_logged", False)
-        if should_log and torch.cuda.is_available():
+        if torch.cuda.is_available():
             torch.cuda.synchronize()
-        start = time.perf_counter() if should_log else None
+        start = time.perf_counter()
         attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        if should_log:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if not getattr(self, "_sdpa_logged", False):
             backend = "SDPA path active"
             try:
                 if not torch.backends.cuda.sdp_kernel.is_flash_enabled():
