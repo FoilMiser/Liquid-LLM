@@ -34,9 +34,11 @@ class TeacherWrapper:
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
+        self.device = next(self.model.parameters()).device
 
     @torch.inference_mode()
     def logits(self, input_ids: torch.Tensor) -> torch.Tensor:
+        input_ids = input_ids.to(self.device)
         outputs = self.model(input_ids=input_ids)
         return outputs.logits
 

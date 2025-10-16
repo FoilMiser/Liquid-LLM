@@ -13,9 +13,9 @@ from torch.utils.data import DataLoader
 
 from . import data
 from .gcs_io import ensure_local_dir
-from .model_init import initialize_student
+from .model_init import apply_grad_checkpointing, initialize_student
 from .prep import DatasetSpec, ensure_toolkit, load_datasets_yaml, normalize_gcs_uri, prepare_if_needed
-from .runtime_setup import install_flash_attn_from_gcs, login_hf
+from .runtime_setup import enable_flash_attn_if_available, install_flash_attn_from_gcs, login_hf
 from .teacher import TeacherConfig, TeacherWrapper
 from .train import Trainer
 from .utils import AnnealingSchedule, configure_logging, detect_training_device, json_log, set_seed
@@ -46,11 +46,12 @@ DEFAULTS = {
     "logs_gcs_uri": "gs://liquid-llm-bucket-2/logs/stage1_console/",
     "tb_gcs_uri": "gs://liquid-llm-bucket-2/logs/tb/",
     "teacher_logits_dir": "gs://liquid-llm-bucket-2/teacher/llama-3.2-3b/logits",
+    "grad_checkpoint": True,
 }
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Liquid LLM Stage-1 Trainer")
+    parser = argparse.ArgumentParser(description="Liquid LLM Stage-1 Trainer", conflict_handler="resolve")
     for key, value in DEFAULTS.items():
         arg = f"--{key}".replace("_", "-")
         parser.add_argument(arg, default=value)
@@ -82,6 +83,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--prep-install-requirements", type=_str_to_bool, default=True)
     parser.add_argument("--prep-timeout-s", type=int, default=0)
     parser.add_argument("--val-manifest", default=None)
+    parser.add_argument("--grad-checkpoint", type=_str_to_bool, default=DEFAULTS["grad_checkpoint"])
     return parser.parse_args(argv)
 
 
@@ -179,6 +181,44 @@ def _write_data_artifacts(
             fh.write(json.dumps(entry, sort_keys=True) + "\n")
 
 
+def _log_startup_banner(
+    toolkit_zip: str,
+    prepare_mode: str,
+    data_summary: dict,
+    teacher_mode: str,
+    teacher_id: str,
+    kd_temperature: float,
+    alpha_start: float,
+    alpha_end: float,
+    anneal_pct: float,
+) -> None:
+    logger = configure_logging()
+    logger.info("========== DATA + KD STARTUP ==========")
+    logger.info("toolkit_zip=%s", toolkit_zip)
+    logger.info("prepare_data=%s", prepare_mode)
+    datasets = data_summary.get("datasets", {})
+    for key, info in sorted(datasets.items()):
+        status = info.get("status", "ready")
+        out_dir = info.get("output")
+        files = info.get("after_files", info.get("before_files", info.get("record_count", 0)))
+        logger.info("  dataset=%s | status=%s | output=%s | count=%s", key, status, out_dir, files)
+    logger.info(
+        "teacher_mode=%s | teacher_id=%s | kd_temp=%.2f | alpha_start=%.2f | alpha_end=%.2f | anneal_pct=%.2f",
+        teacher_mode,
+        teacher_id,
+        kd_temperature,
+        alpha_start,
+        alpha_end,
+        anneal_pct,
+    )
+    attn_enabled = enable_flash_attn_if_available()
+    if attn_enabled:
+        logger.info("attention_backend=SDPA enabled")
+    else:
+        logger.warning("attention_backend=SDPA disabled")
+    logger.info("======================================")
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
     logger = configure_logging()
@@ -213,6 +253,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         tokenizer,
         seq_len=args.seq_len,
         tool_use_ratio=args.tool_use_ratio,
+        teacher_mode=args.teacher_mode,
+        teacher_logits_dir=args.teacher_logits_dir if args.teacher_mode == "precompute" else None,
     )
     train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = None
@@ -223,26 +265,56 @@ def main(argv: Optional[list[str]] = None) -> None:
             tokenizer,
             seq_len=args.seq_len,
             tool_use_ratio=0.0,
+            teacher_mode="precompute",
         )
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    elif len(dataset) > 0:
+        from torch.utils.data import Subset
+
+        subset_size = min(128, len(dataset))
+        val_indices = list(range(subset_size))
+        val_loader = DataLoader(Subset(dataset, val_indices), batch_size=args.batch_size, shuffle=False)
     data_readiness = _augment_data_readiness(prep_summary, dataset, manifest_snapshot, toolkit_zip)
     data_readiness["dataset_manifest"] = args.dataset_manifest
     if args.val_manifest:
         data_readiness["val_manifest"] = args.val_manifest
     _write_data_artifacts(local_root, data_readiness, datasets_cfg, manifest_snapshot)
-    model = initialize_student(args.resume_gcs_uri, local_root, seq_len=args.seq_len)
-    output_gcs = args.output_gcs_uri.rstrip("/") + f"/{run_id}"
+    _log_startup_banner(
+        toolkit_zip,
+        args.prepare_data,
+        data_readiness,
+        args.teacher_mode,
+        args.teacher_id,
+        float(args.kd_temperature),
+        float(args.kd_alpha_start),
+        float(args.kd_alpha_end),
+        float(args.kd_anneal_pct),
+    )
+    output_gcs_root = args.output_gcs_uri.rstrip("/")
+    model = initialize_student(
+        args.resume_gcs_uri,
+        local_root,
+        seq_len=args.seq_len,
+        output_gcs_uri=output_gcs_root,
+        run_id=run_id,
+    )
+    grad_checkpoint = bool(args.grad_checkpoint)
+    model = apply_grad_checkpointing(model, grad_checkpoint)
     betas = _parse_betas(args.betas)
     kd_alpha_schedule = AnnealingSchedule(args.kd_alpha_start, args.kd_alpha_end, args.kd_anneal_pct)
     ce_beta_schedule = AnnealingSchedule(1 - args.kd_alpha_start, 1 - args.kd_alpha_end, args.kd_anneal_pct)
     logit_l2_schedule = AnnealingSchedule(args.keep_old_logit_l2, 0.0, args.keep_old_logit_l2_fade_step / max(1, args.max_steps))
+    teacher = None
+    if args.teacher_mode == "online":
+        teacher = TeacherWrapper(TeacherConfig(model_id=args.teacher_id))
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         device=device_info.device,
         output_dir=local_root,
-        output_gcs_uri=output_gcs,
+        output_gcs_uri=output_gcs_root,
+        run_id=run_id,
         lr=args.lr,
         betas=betas,
         weight_decay=args.weight_decay,
@@ -254,6 +326,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         logit_l2_gamma_schedule=logit_l2_schedule,
         logit_reference=None,
         precision=args.precision,
+        teacher=teacher,
+        teacher_mode=args.teacher_mode,
+        teacher_logits_dir=args.teacher_logits_dir if args.teacher_mode == "precompute" else None,
+        eval_every=args.eval_every,
+        save_every=args.save_every,
     )
     json_log(
         logger,
@@ -261,15 +338,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             "teacher_mode": args.teacher_mode,
             "dataset_size": len(dataset),
             "seq_len": args.seq_len,
-            "output_gcs": output_gcs,
+            "output_gcs": f"{output_gcs_root}/{run_id}",
+            "grad_checkpoint": grad_checkpoint,
         },
     )
-    if args.teacher_mode == "online":
-        teacher = TeacherWrapper(TeacherConfig(model_id=args.teacher_id))
-        # Example integration: pre-fetch logits for first batch
-        for batch in train_loader:
-            batch["teacher_logits"] = teacher.logits(batch["input_ids"].to(device_info.device)).cpu()
-            break
     trainer.train()
 
 

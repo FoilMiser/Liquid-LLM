@@ -8,6 +8,7 @@ from typing import Dict, Iterable, List, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .gcs_io import gcs_to_local
 from .runtime_setup import enable_flash_attn_if_available
@@ -42,7 +43,6 @@ class Attention(nn.Module):
         super().__init__()
         self.n_heads = config.n_heads
         self.head_dim = config.hidden_size // config.n_heads
-        self.scale = self.head_dim ** -0.5
         self.q_proj = nn.Linear(config.hidden_size, config.hidden_size)
         self.k_proj = nn.Linear(config.hidden_size, config.hidden_size)
         self.v_proj = nn.Linear(config.hidden_size, config.hidden_size)
@@ -50,18 +50,11 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, hidden = x.shape
-        q = self.q_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim)
-        k = self.k_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim)
-        v = self.v_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1).bool()
-        scores = scores.masked_fill(mask, float("-inf"))
-        attn = torch.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, hidden)
+        q = self.q_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = attn.transpose(1, 2).contiguous().view(bsz, seq_len, hidden)
         return self.out_proj(out)
 
 
@@ -144,15 +137,48 @@ def load_student_from_gcs(gcs_uri: str, seq_len: int) -> Tuple[StudentModel, Dic
     return model, state_dict
 
 
-def save_frozen_mask(run_dir: str, block_names: Iterable[str]) -> None:
+def save_frozen_mask(run_dir: str, block_names: Iterable[str], *, output_gcs_uri: str | None = None, run_id: str | None = None) -> Path:
     ensure_dir(run_dir)
     path = Path(run_dir) / "frozen_mask.json"
     with path.open("w", encoding="utf-8") as f:
         json.dump({"trainable_blocks": list(block_names)}, f, indent=2, sort_keys=True)
+    if output_gcs_uri and run_id:
+        from .gcs_io import local_to_gcs
+
+        dest = f"{output_gcs_uri.rstrip('/')}/{run_id}/frozen_mask.json"
+        local_to_gcs(str(path), dest)
+    return path
 
 
-def initialize_student(gcs_uri: str, run_dir: str, seq_len: int) -> StudentModel:
+def initialize_student(
+    gcs_uri: str,
+    run_dir: str,
+    seq_len: int,
+    *,
+    output_gcs_uri: str | None = None,
+    run_id: str | None = None,
+) -> StudentModel:
     model, _ = load_student_from_gcs(gcs_uri, seq_len)
     enable_flash_attn_if_available()
-    save_frozen_mask(run_dir, _FROZEN_BLOCK_NAMES)
+    save_frozen_mask(run_dir, _FROZEN_BLOCK_NAMES, output_gcs_uri=output_gcs_uri, run_id=run_id)
+    return model
+
+
+def apply_grad_checkpointing(model: nn.Module, enabled: bool) -> nn.Module:
+    if not enabled:
+        return model
+    import torch.utils.checkpoint as cp
+
+    for module in model.modules():
+        name = module.__class__.__name__.lower()
+        if name.endswith("block") or name.endswith("layer"):
+            if getattr(module, "_checkpoint_wrapped", False):
+                continue
+            orig_forward = module.forward
+
+            def checkpointed_forward(*args, _orig=orig_forward, **kwargs):
+                return cp.checkpoint(_orig, *args, **kwargs)
+
+            module.forward = checkpointed_forward  # type: ignore[assignment]
+            setattr(module, "_checkpoint_wrapped", True)
     return model

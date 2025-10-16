@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 
 def ce_loss(student_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    return F.cross_entropy(student_logits.view(-1, student_logits.size(-1)), labels.view(-1))
+    return F.cross_entropy(student_logits.reshape(-1, student_logits.size(-1)), labels.reshape(-1))
 
 
 def kd_loss(
