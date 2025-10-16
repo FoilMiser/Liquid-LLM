@@ -461,6 +461,8 @@ class Trainer:
         except StopIteration:
             # Re-raise: our infinite iterator should not exhaust.
             raise
+        if self.scaler.is_enabled():
+            self.scaler.unscale_(self.optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         if not math.isfinite(float(grad_norm)):
             return self._handle_non_finite("grad")
