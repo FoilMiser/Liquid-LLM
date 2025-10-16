@@ -1,6 +1,8 @@
 """Training loop implementation for Stage-1 KD."""
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -63,8 +65,10 @@ class Trainer:
             self.amp_dtype = torch.float32
         if hasattr(self.model, "gradient_checkpointing_enable"):
             self.model.gradient_checkpointing_enable()
+        self._provenance_synced = False
 
     def _save_checkpoint(self, name: str, step: int, val_ppl: float, losses_dict: Dict[str, float]) -> None:
+        self._ensure_provenance_artifacts()
         path = Path(self.output_dir) / name
         state = {
             "model": self.model.state_dict(),
@@ -150,3 +154,16 @@ class Trainer:
             step += 1
         if self.output_gcs_uri:
             local_to_gcs(self.output_dir, self.output_gcs_uri)
+
+    def _ensure_provenance_artifacts(self) -> None:
+        if self._provenance_synced:
+            return
+        source_dir = Path(os.environ.get("STAGE1_DATA_PROVENANCE_DIR", self.output_dir))
+        target_dir = Path(self.output_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("data_readiness.json", "datasets_yaml_snapshot.yaml", "manifest_snapshot.jsonl"):
+            src = source_dir / name
+            dst = target_dir / name
+            if src.exists() and not dst.exists():
+                shutil.copy(src, dst)
+        self._provenance_synced = True

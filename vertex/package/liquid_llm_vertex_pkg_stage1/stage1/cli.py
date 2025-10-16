@@ -2,13 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
-from typing import Optional
+import copy
+from pathlib import Path
+from typing import Dict, Optional
+
+import yaml
 from torch.utils.data import DataLoader
 
 from . import data
 from .gcs_io import ensure_local_dir
 from .model_init import initialize_student
+from .prep import DatasetSpec, ensure_toolkit, load_datasets_yaml, normalize_gcs_uri, prepare_if_needed
 from .runtime_setup import install_flash_attn_from_gcs, login_hf
 from .teacher import TeacherConfig, TeacherWrapper
 from .train import Trainer
@@ -67,6 +73,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=DEFAULTS["weight_decay"])
     parser.add_argument("--tool-use-ratio", type=float, default=DEFAULTS["tool_use_ratio"])
     parser.add_argument("--batch-per-device", type=int, default=1)
+    parser.add_argument("--prepare-data", choices=["auto", "force", "skip"], default="auto")
+    parser.add_argument(
+        "--prep-toolkit-zip-uri",
+        default="gs://liquid-llm-bucket-2/sandbox/preprocess-toolkit/preprocess-toolkit-stage1-1-0.zip",
+    )
+    parser.add_argument("--prep-extract-dir", default="/opt/preprocess-toolkit")
+    parser.add_argument("--prep-install-requirements", type=_str_to_bool, default=True)
+    parser.add_argument("--prep-timeout-s", type=int, default=0)
+    parser.add_argument("--val-manifest", default=None)
     return parser.parse_args(argv)
 
 
@@ -75,6 +90,93 @@ def _parse_betas(betas: str) -> tuple[float, float]:
     if len(parts) != 2:
         raise ValueError("Betas must contain two comma separated values")
     return parts[0], parts[1]
+
+
+def _str_to_bool(value: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"1", "true", "yes", "y"}:
+        return True
+    if value in {"0", "false", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def _log_data_bootstrap(
+    toolkit_uri: str,
+    extract_dir: str,
+    install_requirements: bool,
+    mode: str,
+    summary: dict,
+) -> None:
+    logger = configure_logging()
+    logger.info("========== DATA BOOTSTRAP ==========")
+    logger.info(
+        "toolkit=%s | extract_dir=%s | install_requirements=%s",
+        toolkit_uri,
+        extract_dir,
+        install_requirements,
+    )
+    logger.info("prepare_data=%s", mode)
+    datasets = summary.get("datasets", {})
+    for job, info in datasets.items():
+        status = info.get("status", "UNKNOWN")
+        out_dir = info.get("output")
+        file_count = info.get("after_files", info.get("before_files", 0))
+        logger.info("  %s | %s | %s | files=%s", job, status, out_dir, file_count)
+    logger.info("====================================")
+
+
+def _augment_data_readiness(
+    prep_summary: dict,
+    dataset: data.ManifestDataset,
+    manifest_snapshot: list[dict],
+    toolkit_zip: str,
+) -> dict:
+    summary = copy.deepcopy(prep_summary)
+    summary["toolkit_zip_uri"] = toolkit_zip
+    summary["manifest_size"] = len(manifest_snapshot)
+    summary["total_records"] = len(dataset)
+    summary.setdefault("prepare_data_mode", summary.get("mode"))
+    datasets_summary: Dict[str, dict] = summary.setdefault("datasets", {})
+    key_to_path: Dict[str, str] = {}
+    for entry in dataset.entries:
+        key = entry.dataset_id or entry.resolved_path
+        key_to_path.setdefault(key, entry.resolved_path)
+    for key, count in dataset.dataset_counts.items():
+        ds_entry = datasets_summary.setdefault(key, {})
+        if "output" not in ds_entry:
+            ds_entry["output"] = key_to_path.get(key)
+        ds_entry["record_count"] = count
+    return summary
+
+
+def _write_data_artifacts(
+    run_dir: str,
+    data_readiness: dict,
+    datasets_cfg: Dict[str, DatasetSpec],
+    manifest_snapshot: list[dict],
+) -> None:
+    path = Path(run_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    readiness_path = path / "data_readiness.json"
+    readiness_path.write_text(json.dumps(data_readiness, indent=2, sort_keys=True), encoding="utf-8")
+    yaml_snapshot = {
+        job: {
+            "in": spec.inp,
+            "out": spec.out,
+            "type": spec.dtype,
+            "manifest": spec.manifest,
+        }
+        for job, spec in datasets_cfg.items()
+    }
+    with (path / "datasets_yaml_snapshot.yaml").open("w", encoding="utf-8") as fh:
+        yaml.safe_dump(yaml_snapshot, fh, sort_keys=True)
+    manifest_path = path / "manifest_snapshot.jsonl"
+    with manifest_path.open("w", encoding="utf-8") as fh:
+        for entry in manifest_snapshot:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -91,13 +193,43 @@ def main(argv: Optional[list[str]] = None) -> None:
         args.seq_len,
         args.teacher_mode,
     )
-    tokenizer = data.build_tokenizer(args.teacher_id)
-    manifest_entries = data.read_manifest(args.dataset_manifest)
-    dataset = data.ManifestDataset(manifest_entries, tokenizer, seq_len=args.seq_len, tool_use_ratio=args.tool_use_ratio)
-    train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = None
     run_id = os.environ.get("AIP_TRAINING_JOB_ID", "local")
     local_root = ensure_local_dir(os.path.join("/tmp", "vertex_run", run_id))
+    os.environ["STAGE1_DATA_PROVENANCE_DIR"] = local_root
+    toolkit_zip = normalize_gcs_uri(args.prep_toolkit_zip_uri)
+    toolkit_dir = ensure_toolkit(toolkit_zip, args.prep_extract_dir, args.prep_install_requirements)
+    datasets_cfg = load_datasets_yaml(toolkit_dir)
+    prep_summary = prepare_if_needed(
+        args.prepare_data,
+        toolkit_dir,
+        datasets_cfg,
+        timeout_s=args.prep_timeout_s,
+    )
+    _log_data_bootstrap(toolkit_zip, args.prep_extract_dir, args.prep_install_requirements, args.prepare_data, prep_summary)
+    tokenizer = data.build_tokenizer(args.teacher_id)
+    manifest_entries, manifest_snapshot = data.read_manifest(args.dataset_manifest, datasets_cfg)
+    dataset = data.ManifestDataset(
+        manifest_entries,
+        tokenizer,
+        seq_len=args.seq_len,
+        tool_use_ratio=args.tool_use_ratio,
+    )
+    train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = None
+    if args.val_manifest:
+        val_entries, _ = data.read_manifest(args.val_manifest, datasets_cfg)
+        val_dataset = data.ManifestDataset(
+            val_entries,
+            tokenizer,
+            seq_len=args.seq_len,
+            tool_use_ratio=0.0,
+        )
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    data_readiness = _augment_data_readiness(prep_summary, dataset, manifest_snapshot, toolkit_zip)
+    data_readiness["dataset_manifest"] = args.dataset_manifest
+    if args.val_manifest:
+        data_readiness["val_manifest"] = args.val_manifest
+    _write_data_artifacts(local_root, data_readiness, datasets_cfg, manifest_snapshot)
     model = initialize_student(args.resume_gcs_uri, local_root, seq_len=args.seq_len)
     output_gcs = args.output_gcs_uri.rstrip("/") + f"/{run_id}"
     betas = _parse_betas(args.betas)
