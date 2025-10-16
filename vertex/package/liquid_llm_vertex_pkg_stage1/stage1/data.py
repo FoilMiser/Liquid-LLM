@@ -17,7 +17,9 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # pragma: no cover - handled at runtime
     pq = None
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
@@ -30,6 +32,8 @@ logger = configure_logging()
 
 _CACHE_DIR = Path("/tmp/manifest_cache")
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_LOGIT_CACHE_DIR = Path("/tmp/teacher_logits")
+_LOGIT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
@@ -181,6 +185,8 @@ class ManifestDataset(Dataset):
         tokenizer: PreTrainedTokenizerBase,
         seq_len: int,
         tool_use_ratio: float = 0.0,
+        teacher_mode: str = "precompute",
+        teacher_logits_dir: Optional[str] = None,
     ) -> None:
         self.entries = list(manifest_entries)
         self.tokenizer = tokenizer
@@ -188,6 +194,9 @@ class ManifestDataset(Dataset):
         self.tool_use_ratio = tool_use_ratio
         self.samples: List[Dict[str, str]] = []
         self.dataset_counts: Dict[str, int] = {}
+        self.teacher_mode = teacher_mode
+        self.teacher_logits_dir = teacher_logits_dir.rstrip("/") if teacher_logits_dir else None
+        self._teacher_cache: Dict[str, torch.Tensor] = {}
         self._build_index()
 
     def _build_index(self) -> None:
@@ -228,12 +237,70 @@ class ManifestDataset(Dataset):
             padding="max_length",
             return_tensors="pt",
         )
-        return {
+        item = {
             "input_ids": tokens["input_ids"].squeeze(0),
             "attention_mask": tokens["attention_mask"].squeeze(0),
             "type": sample["type"],
             "sample_id": sample["sample_id"],
         }
+        if self.teacher_mode == "precompute" and self.teacher_logits_dir:
+            logits = self._load_teacher_logits(sample["sample_id"])
+            if logits is not None:
+                item["teacher_logits"] = logits
+        return item
+
+    def _materialize_teacher_path(self, sample_id: str, ext: str) -> Optional[str]:
+        base = f"{self.teacher_logits_dir}/{sample_id}{ext}"
+        if base.startswith("gs://"):
+            cache_name = hashlib.md5(base.encode("utf-8")).hexdigest()
+            local_path = _LOGIT_CACHE_DIR / f"{cache_name}{ext}"
+            if local_path.exists():
+                return str(local_path)
+            try:
+                return gcs_to_local(base, str(local_path))
+            except GCSIOError:
+                return None
+        path = Path(base)
+        if path.exists():
+            return str(path)
+        return None
+
+    def _normalize_teacher_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        logits = logits.float()
+        if logits.dim() != 2:
+            logits = logits.view(-1, logits.shape[-1])
+        seq_len, vocab_size = logits.shape
+        if seq_len < self.seq_len:
+            logits = F.pad(logits, (0, 0, 0, self.seq_len - seq_len))
+        elif seq_len > self.seq_len:
+            logits = logits[: self.seq_len]
+        target_vocab = getattr(self.tokenizer, "vocab_size", vocab_size)
+        if vocab_size < target_vocab:
+            logits = F.pad(logits, (0, target_vocab - vocab_size))
+        elif vocab_size > target_vocab:
+            logits = logits[:, :target_vocab]
+        return logits
+
+    def _load_teacher_logits(self, sample_id: str) -> Optional[torch.Tensor]:
+        if sample_id in self._teacher_cache:
+            return self._teacher_cache[sample_id]
+        if not self.teacher_logits_dir:
+            return None
+        for ext in (".pt", ".npy"):
+            path = self._materialize_teacher_path(sample_id, ext)
+            if not path:
+                continue
+            try:
+                if ext == ".pt":
+                    tensor = torch.load(path, map_location="cpu")
+                else:
+                    tensor = torch.from_numpy(np.load(path, allow_pickle=False))
+            except Exception:
+                continue
+            logits = self._normalize_teacher_logits(torch.as_tensor(tensor))
+            self._teacher_cache[sample_id] = logits
+            return logits
+        return None
 
 
 def build_tokenizer(model_id: str) -> PreTrainedTokenizerBase:
