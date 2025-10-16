@@ -58,8 +58,10 @@ def test_checkpoint_uploads_immediately(tmp_path, monkeypatch):
         save_every=0,
     )
     monkeypatch.setenv("STAGE1_DATA_PROVENANCE_DIR", str(tmp_path))
+    (tmp_path / "frozen_mask.json").write_text("{}", encoding="utf-8")
     with mock.patch("stage1.train.local_to_gcs") as upload_mock:
         trainer._save_checkpoint("last.pt", 0, 1.0, {"loss_total": 0.0})
         destinations = [call.args[1] for call in upload_mock.call_args_list]
         assert f"gs://bucket/path/run123/last.pt" in destinations
         assert f"gs://bucket/path/run123/run_meta.json" in destinations
+        assert f"gs://bucket/path/run123/frozen_mask.json" in destinations

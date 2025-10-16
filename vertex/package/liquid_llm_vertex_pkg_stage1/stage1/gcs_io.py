@@ -85,34 +85,44 @@ def gcs_to_local(gcs_uri: str, local_path: str, retries: int = _DEF_RETRIES) -> 
 
 
 def local_to_gcs(local_path: str, gcs_uri: str, retries: int = _DEF_RETRIES) -> None:
-    """Upload a local file or directory to GCS."""
+    """Upload a local file or directory to GCS with verification."""
 
-    if _has_gcloud():
-        def _upload_cmd() -> None:
-            result = _run_command(["gcloud", "storage", "cp", "-r", local_path, gcs_uri])
-            if result.returncode != 0:
-                raise GCSIOError(result.stderr)
-            logger.info("Uploaded %s -> %s", local_path, gcs_uri)
+    src_path = Path(local_path)
 
-        _with_retries(_upload_cmd, retries=retries)
-        return
+    def _upload_file(src: Path, dest: str) -> None:
+        if _has_gcloud():
+            def _cmd() -> None:
+                result = _run_command(["gcloud", "storage", "cp", str(src), dest])
+                if result.returncode != 0:
+                    raise GCSIOError(result.stderr)
+                verify = _run_command(["gcloud", "storage", "ls", dest])
+                if verify.returncode != 0:
+                    raise GCSIOError(verify.stderr)
+                logger.info("Uploaded %s -> %s", src, dest)
 
-    def _upload_fs() -> None:
-        fs = _gcsfs_filesystem()
-        src_path = Path(local_path)
-        if src_path.is_dir():
-            for child in src_path.rglob("*"):
-                if child.is_file():
-                    rel = child.relative_to(src_path)
-                    fs_path = f"{gcs_uri.rstrip('/')}/{rel.as_posix()}"
-                    with open(child, "rb") as src, fs.open(fs_path, "wb") as dst:
-                        dst.write(src.read())
-        else:
-            with open(local_path, "rb") as src, fs.open(gcs_uri, "wb") as dst:
-                dst.write(src.read())
-        logger.info("Uploaded (gcsfs) %s -> %s", local_path, gcs_uri)
+            _with_retries(_cmd, retries=retries)
+            return
 
-    _with_retries(_upload_fs, retries=retries)
+        def _upload_fs() -> None:
+            fs = _gcsfs_filesystem()
+            with open(src, "rb") as src_handle, fs.open(dest, "wb") as dst_handle:
+                dst_handle.write(src_handle.read())
+            try:
+                fs.info(dest)
+            except Exception as exc:  # pragma: no cover - runtime verification
+                raise GCSIOError(f"Failed to verify upload for {dest}: {exc}")
+            logger.info("Uploaded (gcsfs) %s -> %s", src, dest)
+
+        _with_retries(_upload_fs, retries=retries)
+
+    if src_path.is_dir():
+        for child in sorted(src_path.rglob("*")):
+            if child.is_file():
+                rel = child.relative_to(src_path)
+                dest = f"{gcs_uri.rstrip('/')}/{rel.as_posix()}"
+                _upload_file(child, dest)
+    else:
+        _upload_file(src_path, gcs_uri)
 
 
 def list_gcs(uri: str, retries: int = _DEF_RETRIES) -> List[str]:
