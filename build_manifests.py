@@ -14,6 +14,7 @@ import yaml
 DEFAULT_DATASETS_YAML = "preprocess_toolkit/config/datasets.yaml"
 DEFAULT_OUT_DIR = "vertex/package/sandbox/manifest"
 DEFAULT_BUCKET_PREFIX = "gs://liquid-llm-bucket-2/datasets/stage1/manifests"
+DEFAULT_OUT_PREFIX = "gs://liquid-llm-bucket-2/datasets/stage1/shards"
 
 
 class ManifestError(RuntimeError):
@@ -36,6 +37,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--bucket-prefix",
         default=DEFAULT_BUCKET_PREFIX,
         help="GCS prefix for manifest uploads.",
+    )
+    parser.add_argument(
+        "--default-out-prefix",
+        default=DEFAULT_OUT_PREFIX,
+        help="Default GCS prefix used to construct dataset 'out' when missing or not a gs:// URI.",
+    )
+    parser.add_argument(
+        "--coerce-out-to-gcs",
+        default=True,
+        type=lambda v: str(v).lower() not in {"0", "false", "no", "n"},
+        help="If true, coerce missing/non-GCS 'out' to <default-out-prefix>/<job>.",
     )
     return parser.parse_args(argv)
 
@@ -79,7 +91,9 @@ def normalize_weight(value: object | None) -> float:
         raise ManifestError(f"Manifest weight must be numeric, got: {value!r}") from exc
 
 
-def build_entry_from_yaml(job: str, payload: Mapping[str, object]) -> ManifestEntry:
+def build_entry_from_yaml(
+    job: str, payload: Mapping[str, object], default_out_prefix: str, coerce: bool
+) -> ManifestEntry:
     if not isinstance(payload, Mapping):
         raise ManifestError(f"Dataset '{job}' payload must be a mapping.")
 
@@ -101,21 +115,36 @@ def build_entry_from_yaml(job: str, payload: Mapping[str, object]) -> ManifestEn
         return entry
 
     out_value = payload.get("out")
+    coerced = False
     if not isinstance(out_value, str) or not out_value.strip():
-        raise ManifestError(
-            f"Dataset '{job}' is missing required 'out' field needed to build manifest entry."
-        )
-    out_value = out_value.strip()
-    if not out_value.startswith("gs://"):
-        raise ManifestError(
-            f"Dataset '{job}' has out='{out_value}', expected it to start with 'gs://'."
-        )
+        if coerce:
+            sanitized = job.replace("/", "_").replace(":", "_")
+            out_value = f"{default_out_prefix.rstrip('/')}/{sanitized}"
+            coerced = True
+        else:
+            raise ManifestError(
+                f"Dataset '{job}' is missing required 'out' field needed to build manifest entry."
+            )
+    else:
+        out_value = out_value.strip()
+        if not out_value.startswith("gs://"):
+            if coerce:
+                sanitized = job.replace("/", "_").replace(":", "_")
+                out_value = f"{default_out_prefix.rstrip('/')}/{sanitized}"
+                coerced = True
+            else:
+                raise ManifestError(
+                    f"Dataset '{job}' has out='{out_value}', expected it to start with 'gs://'."
+                )
 
     entry = {
         "path": f"{out_value.rstrip('/')}/*.jsonl",
         "type": str(payload.get("type", "lm")).strip().lower() or "lm",
         "weight": 1.0,
     }
+    if coerced:
+        coerced_path = entry["path"].rsplit("/", 1)[0]
+        print(f"[info] Coerced out => {coerced_path} for dataset '{job}'")
     return entry
 
 
@@ -176,7 +205,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Skipping non-string job key: {job!r}", file=sys.stderr)
             continue
         try:
-            entry = build_entry_from_yaml(job, payload)
+            entry = build_entry_from_yaml(
+                job, payload, args.default_out_prefix, args.coerce_out_to_gcs
+            )
         except ManifestError as exc:
             print(f"Error processing dataset '{job}': {exc}", file=sys.stderr)
             return 1
