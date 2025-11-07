@@ -18,6 +18,9 @@ from .utils import configure_logging, ensure_dir
 logger = configure_logging()
 
 
+EXPECTED_VOCAB_SIZE = 128_256
+
+
 @dataclass
 class StudentConfig:
     vocab_size: int
@@ -117,6 +120,12 @@ def infer_config_from_state_dict(state_dict: Dict[str, torch.Tensor], seq_len: i
         if "embed" in key and tensor.ndim == 2:
             vocab_size = tensor.shape[0]
             break
+    if vocab_size != EXPECTED_VOCAB_SIZE:
+        raise ValueError(
+            "Student checkpoint vocab size mismatch: "
+            f"found {vocab_size}, expected {EXPECTED_VOCAB_SIZE}. "
+            "Run the tokenizer-alignment step so KD uses the 128,256-row student."
+        )
     hidden_size = next(iter(state_dict.values())).shape[-1]
     n_layers = len({key.split(".")[2] for key in state_dict if key.startswith("blocks.")})
     n_heads = 16

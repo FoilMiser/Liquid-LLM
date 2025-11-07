@@ -11,6 +11,12 @@ tqdm==4.66.4
 pyyaml==6.0.2
 einops==0.8.0
 
+# Hugging Face tooling for tokenizer/model alignment
+transformers>=4.44.2
+accelerate>=0.34.2
+sentencepiece>=0.2.0
+safetensors>=0.4.5
+
 # Jupyter & notebook utilities
 ipykernel>=6.29.5
 jupyterlab>=4.2.5
